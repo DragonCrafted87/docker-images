@@ -1,0 +1,113 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-added-large-files
+  - id: check-case-conflict
+  - id: check-merge-conflict
+  - id: detect-private-key
+  - id: end-of-file-fixer
+  - id: file-contents-sorter
+    args:
+    - --unique
+    files: (\.gitignore$|\.dict$)
+  - id: fix-byte-order-marker
+  - id: forbid-new-submodules
+  - id: forbid-submodules
+  - id: mixed-line-ending
+    args:
+    - --fix=lf
+  - id: trailing-whitespace
+  - id: check-executables-have-shebangs
+  - id: check-shebang-scripts-are-executable
+  - id: check-symlinks
+  - id: destroyed-symlinks
+  - id: check-builtin-literals
+  - id: check-docstring-first
+  - id: debug-statements
+  - id: requirements-txt-fixer
+  - id: check-json
+  - id: pretty-format-json
+    args:
+    - --autofix
+    - --indent
+    - '4'
+  - id: check-toml
+  - id: check-xml
+  - id: check-yaml
+- repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
+  rev: v2.16.0
+  hooks:
+  - id: pretty-format-yaml
+    args:
+    - --autofix
+    - --indent
+    - '2'
+- repo: https://github.com/adrienverge/yamllint
+  rev: v1.38.0
+  hooks:
+  - id: yamllint
+- repo: https://github.com/shenxianpeng/hadolint-pre-commit
+  rev: v2.15.1.2
+  hooks:
+  - id: hadolint
+- repo: https://github.com/executablebooks/mdformat
+  rev: 1.0.0
+  hooks:
+  - id: mdformat
+    args:
+    - --end-of-line
+    - lf
+    additional_dependencies:
+    - mdformat-gfm
+    - mdformat-black
+    - mdformat-frontmatter
+- repo: https://github.com/igorshubovych/markdownlint-cli
+  rev: v0.49.1
+  hooks:
+  - id: markdownlint
+- repo: https://github.com/psf/black
+  rev: 26.5.1
+  hooks:
+  - id: black
+    language_version: python3
+- repo: https://github.com/pycqa/isort
+  rev: 9.0.1
+  hooks:
+  - id: isort
+    args:
+    - --profile
+    - black
+    - --filter-files
+    - --force-single-line-imports
+- repo: https://github.com/pycqa/flake8
+  rev: 7.3.0
+  hooks:
+  - id: flake8
+    args:
+    - --extend-ignore=E203
+    - --max-line-length=120
+- repo: https://github.com/PyCQA/pylint
+  rev: v4.0.8
+  hooks:
+  - id: pylint
+    args:
+    - --rcfile=.pylintrc
+- repo: https://github.com/lovesegfault/beautysh
+  rev: v6.4.3
+  hooks:
+  - id: beautysh
+    args:
+    - --indent-size
+    - '4'
+- repo: https://github.com/shellcheck-py/shellcheck-py
+  rev: v0.11.0.1-1
+  hooks:
+  - id: shellcheck
+    args:
+    - --severity=error
+- repo: https://github.com/streetsidesoftware/cspell-cli
+  rev: v10.2.0
+  hooks:
+  - id: cspell
+    exclude: (^\.gitignore$|^\.pre-commit-config\.yaml$|^\.cspell|^\.pylintrc$)

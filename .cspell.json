@@ -1,0 +1,28 @@
+{
+    "dictionaries": [
+        "en_US",
+        "companies",
+        "softwareTerms",
+        "bash",
+        "filetypes",
+        "java",
+        "python",
+        "main"
+    ],
+    "dictionaryDefinitions": [
+        {
+            "addWords": true,
+            "name": "main",
+            "path": "./.cspell/main.dict"
+        }
+    ],
+    "flagWords": [
+        "hte"
+    ],
+    "ignorePaths": [
+        "**/*.dict"
+    ],
+    "language": "en",
+    "minWordLength": 3,
+    "version": "0.2"
+}
