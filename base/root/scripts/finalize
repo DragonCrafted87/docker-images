@@ -1,0 +1,16 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+from os import getpid
+from pathlib import PurePath
+
+from includes.python_logger import create_logger  # pylint: disable=no-name-in-module
+
+
+def main():
+    logger = create_logger(PurePath(__file__).stem)
+    logger.info("Successfully executed base finalize script as pid: %s", getpid())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,3 @@
-# yamllint disable rule:truthy
-# yamllint disable rule:indentation
-# yamllint disable rule:line-length
 name: minecraft
 
 on:
@@ -9,6 +6,7 @@ on:
     branches:
     - main
     tags:
+    - base-v*
     - minecraft-v*
 
 jobs:
@@ -17,6 +15,8 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+    - name: Base tests
+      run: python3 -m unittest discover -s base/tests -v
     - name: Startup tests
       run: python3 -m unittest discover -s minecraft/tests -v
 
@@ -29,14 +29,49 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-    - name: Image name
+    - name: Image names
       id: image
-      run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/alpine-minecraft" >> "$GITHUB_OUTPUT"
-    - name: Docker meta
-      id: meta
+      run: |
+        owner="${GITHUB_REPOSITORY_OWNER,,}"
+        echo "base=ghcr.io/${owner}/alpine" >> "$GITHUB_OUTPUT"
+        echo "minecraft=ghcr.io/${owner}/alpine-minecraft" >> "$GITHUB_OUTPUT"
+    - name: Publish which images
+      id: push
+      run: |
+        base=false
+        minecraft=false
+        ref="$GITHUB_REF"
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$ref" = "refs/heads/main" ]; then
+        base=true
+        minecraft=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/base-v}" != "$ref" ]; then
+        base=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/minecraft-v}" != "$ref" ]; then
+        minecraft=true
+        fi
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        echo "minecraft=$minecraft" >> "$GITHUB_OUTPUT"
+    - name: Base meta
+      id: base-meta
       uses: docker/metadata-action@v5
       with:
-        images: ${{ steps.image.outputs.name }}
+        images: ${{ steps.image.outputs.base }}
+        bake-target: base-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=raw,value=3.24,enable={{is_default_branch}}
+          type=edge,branch=main
+          type=match,pattern=base-v(.*),group=1
+          type=sha
+    - name: Minecraft meta
+      id: minecraft-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.minecraft }}
+        bake-target: minecraft-meta
         flavor: |
           latest=false
         tags: |
@@ -54,11 +89,15 @@ jobs:
         registry: ghcr.io
         username: ${{ github.repository_owner }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build and push
-      uses: docker/build-push-action@v5
+    - name: Build
+      uses: docker/bake-action@v6
       with:
-        context: minecraft
-        platforms: linux/amd64,linux/arm64
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
+        source: .
+        targets: base,minecraft
+        files: |
+          ./docker-bake.hcl
+          cwd://${{ steps.base-meta.outputs.bake-file }}
+          cwd://${{ steps.minecraft-meta.outputs.bake-file }}
+        set: |
+          PUSH_BASE=${{ steps.push.outputs.base }}
+          PUSH_MINECRAFT=${{ steps.push.outputs.minecraft }}

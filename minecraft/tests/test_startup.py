@@ -1,17 +1,36 @@
 # pylint: disable=unused-argument
 import importlib.util
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "root" / "scripts"
+REPO = Path(__file__).resolve().parents[2]
+
+
+def overlay_scripts():
+    """Base scripts, then the Minecraft scripts copied over them."""
+    dest = Path(tempfile.mkdtemp(prefix="minecraft-scripts-")) / "scripts"
+    shutil.copytree(REPO / "base" / "root" / "scripts", dest)
+    minecraft = REPO / "minecraft" / "root" / "scripts"
+    for path in minecraft.rglob("*"):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        target = dest / path.relative_to(minecraft)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    return dest
+
+
+SCRIPTS = overlay_scripts()
 sys.path.insert(0, str(SCRIPTS))
 
-# pylint: disable=wrong-import-position
+# pylint: disable=wrong-import-position,no-name-in-module
 from includes.fabric import fetch  # noqa: E402
 from includes.fabric import release_version  # noqa: E402
 
