@@ -24,11 +24,11 @@ jobs:
       with:
         python-version: '3.12'
     - name: Image test packages
-      run: python3 -m venv /tmp/image-tests && /tmp/image-tests/bin/pip install paho-mqtt ping3 requests
+      run: python3 -m venv /tmp/image-tests && /tmp/image-tests/bin/pip install dirsync paho-mqtt ping3 requests
     - name: Base tests
       run: python3 -m unittest discover -s base/tests -v
     - name: Minecraft tests
-      run: python3 -m unittest discover -s minecraft/tests -v
+      run: /tmp/image-tests/bin/python -m unittest discover -s minecraft/tests -v
     - name: Weather tests
       run: /tmp/image-tests/bin/python -m unittest discover -s ambient-weather-mqtt/tests -v
     - name: Speedtest tests

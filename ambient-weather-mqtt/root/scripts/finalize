@@ -16,21 +16,33 @@ def convert_value(value):
     return value
 
 
+def update_fields(environ):
+    query = environ.get("QUERY_STRING") or ""
+    path = environ.get("PATH_INFO") or ""
+    if query:
+        raw = parse_qs(query)
+    elif "AMBWeather" in path or "dateutc=" in path:
+        raw = parse_qs(path)
+    else:
+        return None
+
+    fields = {}
+    for key, value in raw.items():
+        field = key[key.rfind("/") + 1 :] if "/" in key else key
+        fields[field] = convert_value(value)
+
+    station_types = raw.get("stationtype", [])
+    station_hit = any("AMBWeather" in item for item in station_types)
+    if not (station_hit or "dateutc" in fields or "AMBWeather" in path):
+        return None
+    if "dateutc" not in fields:
+        return None
+    return fields
+
+
 def listener(environ, start_response):
-    if "AMBWeather" in environ["PATH_INFO"]:
-        data_dict = parse_qs("http://" + environ["HTTP_HOST"] + environ["PATH_INFO"])
-
-        keys_list = list(data_dict.keys())
-        for key in keys_list:
-            if "/" in key:
-                value = convert_value(data_dict[key])
-                field = key[key.rfind("/") + 1 :]
-
-                data_dict.pop(key)
-                data_dict[field] = value
-            else:
-                data_dict[key] = convert_value(data_dict[key])
-
+    data_dict = update_fields(environ)
+    if data_dict is not None:
         utc = datetime.strptime(data_dict.pop("dateutc"), "%Y-%m-%d %H:%M:%S")
         utc = utc.replace(tzinfo=timezone.utc)
         local_time = utc.astimezone()
