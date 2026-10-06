@@ -35,6 +35,11 @@ RAM_DRIVE = "/mnt/ramdisk/"
 NFS_DRIVE = "/mnt/minecraft/"
 DATA_STORE = "/mnt/minecraft/store.pckl"
 SAVE_INTERVAL = 300
+# PID 1 is killed when this budget runs out. docker stop -t and
+# terminationGracePeriodSeconds have to be at least STOP_GRACE_SECONDS.
+STOP_WAIT_SECONDS = 20
+COPY_TIMEOUT_SECONDS = 150
+STOP_GRACE_SECONDS = STOP_WAIT_SECONDS + COPY_TIMEOUT_SECONDS + 10
 
 FOLDER_LIST = []
 FOLDER_LIST.append("world")
@@ -44,16 +49,52 @@ FILE_LIST = []
 FILE_LIST.append("banned-ips.json")
 FILE_LIST.append("banned-players.json")
 FILE_LIST.append("ops.json")
+FILE_LIST.append("eula.txt")
 FILE_LIST.append("server.properties")
 FILE_LIST.append("whitelist.json")
+
+# free reports KiB. "max" and the v1 sentinel both mean the cgroup limit is unset.
+CGROUP_V2_MAX = "/sys/fs/cgroup/memory.max"
+CGROUP_V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+ONE_GB_IN_FREE_UNITS = 1_000_000
+UNLIMITED_CGROUP_BYTES = 1 << 60
+
+
+def read_cgroup_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def free_total_kb():
+    completed = run("/usr/bin/free", stdout=PIPE, check=True)
+    return int(completed.stdout.decode("utf-8").split("\n")[1].split()[1])
+
+
+def memory_limit_kb(read_text, read_free_kb):
+    v2_text = read_text(CGROUP_V2_MAX)
+    if v2_text is not None and v2_text.strip() and v2_text.strip() != "max":
+        return int(v2_text.strip()) // 1024
+
+    v1_text = read_text(CGROUP_V1_LIMIT)
+    if v1_text is not None and int(v1_text.strip()) < UNLIMITED_CGROUP_BYTES:
+        return int(v1_text.strip()) // 1024
+
+    return read_free_kb()
+
+
+def heap_gigabytes(limit_kb):
+    if limit_kb < ONE_GB_IN_FREE_UNITS:
+        raise RuntimeError(
+            f"Refusing to start: memory limit {limit_kb} kB is under 1 GB"
+        )
+    return max(1, int((limit_kb / ONE_GB_IN_FREE_UNITS) * 0.25))
 
 
 class LogPipe(Thread):  # pylint: disable=too-many-instance-attributes
     def __init__(self, base_logger, level):
         # pylint: disable=invalid-name
-        """Setup the object with a logger and a log level
-        and start the thread
-        """
         Thread.__init__(self)
         self.daemon = True
         self.level = level
@@ -67,11 +108,9 @@ class LogPipe(Thread):  # pylint: disable=too-many-instance-attributes
         self.start()
 
     def fileno(self):
-        """Return the write file descriptor of the pipe"""
         return self.fdWrite
 
     def run(self):
-        """Run the thread, logging everything."""
         for line in iter(self.pipeReader.readline, ""):
             clean_line = line.strip("\n")
             if self._watch_for_value:
@@ -82,11 +121,9 @@ class LogPipe(Thread):  # pylint: disable=too-many-instance-attributes
         self.pipeReader.close()
 
     def close(self):
-        """Close the write end of the pipe."""
         os_close(self.fdWrite)
 
     def watch_for_value(self, *watch_values):
-        """Setup Watched Value."""
         if watch_values:
             self._watch_for_value = True
             self._watched_values = list(watch_values)
@@ -104,65 +141,64 @@ LOGGER.setLevel(INFO)
 
 
 CHILD_PROCESS = None
+SHUTTING_DOWN = False
+
+
+def tell_server(process, line):
+    try:
+        process.stdin.write(line)
+        process.stdin.flush()
+    except BrokenPipeError:
+        LOGGER.warning("Server closed its console")
+
+
+def mirror(source, target, **options):
+    from dirsync import sync
+
+    Path(target).mkdir(parents=True, exist_ok=True)
+    try:
+        sync(
+            source,
+            target,
+            "sync",
+            logger=LOGGER,
+            verbose=True,
+            create=True,
+            **options,
+        )
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("Sync failed from %s to %s", source, target)
+        raise
 
 
 def copy_directory_to_storage(sub_path):
-    from dirsync import sync
-
-    try:
-        sync(
-            f"{RAM_DRIVE}{sub_path}",
-            f"{NFS_DRIVE}{sub_path}",
-            "sync",
-            logger=LOGGER,
-            verbose=True,
-        )
-    except Exception:  # pylint: disable=broad-except
-        pass
+    mirror(f"{RAM_DRIVE}{sub_path}", f"{NFS_DRIVE}{sub_path}", purge=True)
 
 
 def copy_files_to_storage():
-    from dirsync import sync
-
-    try:
-        sync(
-            RAM_DRIVE,
-            NFS_DRIVE,
-            "sync",
-            logger=LOGGER,
-            verbose=True,
-            only=FILE_LIST,
-        )
-    except Exception:  # pylint: disable=broad-except
-        pass
+    mirror(RAM_DRIVE, NFS_DRIVE, only=FILE_LIST)
+    source_root = Path(RAM_DRIVE)
+    target_root = Path(NFS_DRIVE)
+    for name in FILE_LIST:
+        target = target_root / name
+        if not (source_root / name).exists() and target.is_file():
+            target.unlink()
 
 
 def sync_copy(ram_to_data_store=True):
-    from dirsync import sync
+    if ram_to_data_store:
+        for folder in FOLDER_LIST:
+            copy_directory_to_storage(folder)
+        copy_files_to_storage()
+        return
 
-    try:
-        if ram_to_data_store:
-            for folder in FOLDER_LIST:
-                copy_directory_to_storage(folder)
-            copy_files_to_storage()
-        else:
-            sync(
-                NFS_DRIVE,
-                RAM_DRIVE,
-                "sync",
-                logger=LOGGER,
-                verbose=True,
-            )
-    except Exception:  # pylint: disable=broad-except
-        pass
+    mirror(NFS_DRIVE, RAM_DRIVE, purge=True)
 
 
 def save(process):
     if process.poll() is None:
-        process.stdin.write(b"save-off\n")
-        process.stdin.flush()
-        process.stdin.write(b"save-all\n")
-        process.stdin.flush()
+        tell_server(process, b"save-off\n")
+        tell_server(process, b"save-all\n")
 
         LOGINFO.watch_for_value("Saved the game", "RCON Listener stopped")
         counter = 0
@@ -173,16 +209,22 @@ def save(process):
         save_process = Process(target=sync_copy)
 
         save_process.start()
-        save_process.join(timeout=5000)
+        save_process.join(timeout=COPY_TIMEOUT_SECONDS)
 
         if save_process.is_alive():
             save_process.kill()
             LOGGER.error("Sync Timed Out Stopping Minecraft Server")
-            process.stdin.write(b"stop\n")
-            process.stdin.flush()
+            copy_ok = False
+        elif save_process.exitcode != 0:
+            LOGGER.error("Sync failed")
+            copy_ok = False
         else:
-            process.stdin.write(b"save-on\n")
-            process.stdin.flush()
+            copy_ok = True
+
+        if copy_ok:
+            tell_server(process, b"save-on\n")
+        else:
+            tell_server(process, b"stop\n")
 
 
 def shutdown(process, exit_fn=exit_now):
@@ -195,25 +237,29 @@ def shutdown(process, exit_fn=exit_now):
 
     LOGGER.info("Starting Final Sync")
     if process.poll() is None:
-        process.stdin.write(b"stop\n")
-        process.stdin.flush()
+        tell_server(process, b"stop\n")
 
         counter = 0
         LOGINFO.watch_for_value("RCON Listener stopped")
-        while not LOGINFO.watched_value_found and counter < 30:
+        while not LOGINFO.watched_value_found and counter < STOP_WAIT_SECONDS:
             sleep(1)
             counter = counter + 1
 
     save_process = Process(target=sync_copy)
 
     save_process.start()
-    save_process.join(timeout=5000)
+    save_process.join(timeout=COPY_TIMEOUT_SECONDS)
 
     if save_process.is_alive():
         save_process.kill()
         LOGGER.error("Final Sync Timed out")
+        copy_ok = False
+    elif save_process.exitcode != 0:
+        LOGGER.error("Final Sync failed")
+        copy_ok = False
     else:
         LOGGER.info("Finished Final Sync")
+        copy_ok = True
 
     LOGINFO.close()
     LOGERR.close()
@@ -222,6 +268,8 @@ def shutdown(process, exit_fn=exit_now):
     if exit_code is None:
         process.kill()
         exit_code = 9999
+    if not copy_ok and exit_code == 0:
+        exit_code = 1
 
     exit_fn(exit_code)
 
@@ -240,7 +288,15 @@ def exit_after_failure(process, exit_fn=exit_now):
 
 
 def signal_handler(_sig, _frame):
-    save_and_exit()
+    global SHUTTING_DOWN  # pylint: disable=global-statement
+    if SHUTTING_DOWN:
+        exit_now(1)
+    SHUTTING_DOWN = True
+    try:
+        save_and_exit()
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("Shutdown failed")
+        exit_now(1)
 
 
 def log_retry(url, attempt, attempts, error, delay):
@@ -309,15 +365,7 @@ def install_fabric(minecraft_version):
 def start_minecraft(version_change=False):
     chdir(RAM_DRIVE)
 
-    raw_ram_string = (
-        run("/usr/bin/free", stdout=PIPE, check=True)
-        .stdout.decode("utf-8")
-        .split("\n")[1]
-        .split()[1]
-    )
-
-    total_ram = int(raw_ram_string) / 1000000
-    minecraft_ram = int(total_ram * 0.25)
+    minecraft_ram = heap_gigabytes(memory_limit_kb(read_cgroup_text, free_total_kb))
 
     LOGGER.info("Using %sG RAM for Minecraft", minecraft_ram)
 
@@ -361,18 +409,53 @@ def start_minecraft(version_change=False):
     start_server_script.append("-Daikars.new.flags=true")
     start_server_script.append("-jar")
 
-    # Minecraft Commands
     start_server_script.append(f"{RAM_DRIVE}fabric-server-launch.jar")
     start_server_script.append("--nogui")
     if version_change:
-        # clear the lighting cache
         start_server_script.append("--eraseCache")
-        # Upgrade all Chunks
         start_server_script.append("--forceUpgrade")
 
     return Popen(  # pylint: disable=consider-using-with
         start_server_script, stdin=PIPE, stdout=LOGINFO, stderr=LOGERR
     )
+
+
+def accept_eula():
+    if getenv("EULA", "").lower() != "true":
+        return
+    path = Path(RAM_DRIVE) / "eula.txt"
+    path.write_text(
+        "#By changing the setting below to TRUE you are indicating your agreement "
+        "to our EULA (https://aka.ms/MinecraftEULA).\n"
+        "eula=true\n",
+        encoding="utf-8",
+    )
+
+
+def remember_version(version):
+    with open(DATA_STORE, "wb") as store:
+        pickle_dump(version, store)
+
+
+def wait_until_ready(process):
+    counter = 0
+    LOGINFO.watched_value_found = False
+    LOGINFO.watch_for_value("RCON running")
+    while process.poll() is None:
+        counter = counter + 1
+        if LOGINFO.watched_value_found:
+            return True
+        if counter > SAVE_INTERVAL:
+            return False
+        sleep(5)
+    return False
+
+
+def exit_without_copy(process):
+    code = process.poll() or 1
+    LOGINFO.close()
+    LOGERR.close()
+    exit_now(code)
 
 
 def main():
@@ -389,28 +472,22 @@ def main():
     except OSError:
         LOGGER.info("Failed to find previous Minecraft Version")
 
-    if version_change:
-        with open(DATA_STORE, "wb") as store:
-            pickle_dump(minecraft_version, store)
-
     install_fabric(minecraft_version)
 
     sync_copy(ram_to_data_store=False)
+    accept_eula()
 
     global CHILD_PROCESS  # pylint: disable=global-statement
     CHILD_PROCESS = start_minecraft(version_change)
 
-    # Wait until RCON is up, or for SAVE_INTERVAL tries, so a version
-    # upgrade can finish rewriting chunks.
-    counter = 0
-    LOGINFO.watch_for_value("RCON running")
-    while CHILD_PROCESS.poll() is None:
-        counter = counter + 1
-        if counter > SAVE_INTERVAL or LOGINFO.watched_value_found:
-            break
-        sleep(5)
+    ready = wait_until_ready(CHILD_PROCESS)
+    if CHILD_PROCESS.poll() is not None and not ready:
+        exit_without_copy(CHILD_PROCESS)
+        return
 
-    # save every SAVE_INTERVAL seconds
+    if ready and version_change:
+        remember_version(minecraft_version)
+
     counter = 0
     LOGINFO.watch_for_value("RCON Listener stopped")
     while CHILD_PROCESS.poll() is None and not LOGINFO.watched_value_found:

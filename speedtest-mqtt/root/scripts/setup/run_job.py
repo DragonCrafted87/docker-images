@@ -16,9 +16,13 @@ from ping3 import ping
 from requests import get as requests_get
 from requests import post as requests_post
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 LOGGER = create_logger(PurePath(__file__).stem)
 SLEEP_BETWEEN_MEASUREMENTS = 5
+PING_ATTEMPTS = 4
+PING_RETRY_SECONDS = 1
+REQUEST_TIMEOUT = (10, 60)
 MEASUREMENT_SIZES = [
     100000,
     1000000,
@@ -35,31 +39,42 @@ MEASUREMENT_SIZES = [
 def download(download_bytes):
     try:
         start_time = time()
-        _ = requests_get(f"https://speed.cloudflare.com/__down?bytes={download_bytes}")
+        _ = requests_get(
+            f"https://speed.cloudflare.com/__down?bytes={download_bytes}",
+            timeout=REQUEST_TIMEOUT,
+        )
         finish_time = time()
 
         sleep(SLEEP_BETWEEN_MEASUREMENTS)
 
         duration = finish_time - start_time
-        measurement = (download_bytes / duration) / 100000
-    except RequestsConnectionError:
+        measurement = megabits_per_second(download_bytes, duration)
+    except (RequestsConnectionError, RequestsTimeout):
         measurement = 0
 
     return measurement
+
+
+def megabits_per_second(byte_count, duration):
+    return (byte_count / duration) * 8 / 1_000_000
 
 
 def upload(upload_bytes):
     try:
         upload_data = bytearray(upload_bytes)
         start_time = time()
-        _ = requests_post("https://speed.cloudflare.com/__up", data=upload_data)
+        _ = requests_post(
+            "https://speed.cloudflare.com/__up",
+            data=upload_data,
+            timeout=REQUEST_TIMEOUT,
+        )
         finish_time = time()
 
         sleep(SLEEP_BETWEEN_MEASUREMENTS)
 
         duration = finish_time - start_time
-        measurement = (upload_bytes / duration) / 100000
-    except RequestsConnectionError:
+        measurement = megabits_per_second(upload_bytes, duration)
+    except (RequestsConnectionError, RequestsTimeout):
         measurement = 0
 
     return measurement
@@ -79,12 +94,20 @@ def run_speed_test(iterations_list, operation):
 
 def calculate_ping():
     ping_count = int(getenv("PING_COUNT", "20"))
+    if ping_count < 2:
+        raise ValueError("PING_COUNT must be at least 2")
 
     ping_measurements = []
     for _ in range(ping_count):
         value = None
-        while not value:
+        for attempt in range(PING_ATTEMPTS):
             value = ping("cloudflare.com", unit="ms")
+            if value:
+                break
+            if attempt + 1 < PING_ATTEMPTS:
+                sleep(PING_RETRY_SECONDS)
+        if not value:
+            raise RuntimeError("ping to cloudflare.com failed")
         ping_measurements.append(value)
 
     median_ping = median(ping_measurements)
@@ -102,11 +125,10 @@ def calculate_percentile(data, percentile):
     count = len(sorted_data)
     rank = count * percentile / 100
     if rank.is_integer():
-        return_value = sorted_data[int(rank)]
-    else:
-        rank = int(rank) - 1
-        return_value = (sorted_data[rank] + sorted_data[rank + 1]) / 2
-    return return_value
+        return sorted_data[min(int(rank), count - 1)]
+    lower = max(int(rank) - 1, 0)
+    upper = min(lower + 1, count - 1)
+    return (sorted_data[lower] + sorted_data[upper]) / 2
 
 
 def iteration_counts(name, default):

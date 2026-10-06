@@ -19,6 +19,13 @@ class MeasurementTests(unittest.TestCase):
     def test_percentile_averages_neighbors_when_the_rank_is_fractional(self):
         self.assertEqual(JOB.calculate_percentile([4, 1, 3, 2], 90), 3.5)
 
+    def test_percentile_zero_and_one_hundred_stay_inside_the_sample(self):
+        self.assertEqual(JOB.calculate_percentile([4, 1, 3, 2], 0), 1)
+        self.assertEqual(JOB.calculate_percentile([4, 1, 3, 2], 100), 4)
+
+    def test_low_fractional_percentile_does_not_wrap_to_the_end(self):
+        self.assertEqual(JOB.calculate_percentile([4, 1, 3, 2], 10), 1.5)
+
     def test_download_success_returns_the_rate_and_waits(self):
         clocks = iter([10.0, 12.0])
         with patch.object(JOB, "requests_get", return_value=object()) as get:
@@ -30,7 +37,8 @@ class MeasurementTests(unittest.TestCase):
             get.call_args.args[0], "https://speed.cloudflare.com/__down?bytes=200000"
         )
         slept.assert_called_once_with(JOB.SLEEP_BETWEEN_MEASUREMENTS)
-        self.assertEqual(result, 1.0)
+        self.assertEqual(get.call_args.kwargs["timeout"], JOB.REQUEST_TIMEOUT)
+        self.assertEqual(result, 0.8)
 
     def test_download_connection_error_returns_zero(self):
         with patch.object(
@@ -51,8 +59,9 @@ class MeasurementTests(unittest.TestCase):
 
         self.assertEqual(post.call_args.args[0], "https://speed.cloudflare.com/__up")
         self.assertEqual(len(post.call_args.kwargs["data"]), 100000)
+        self.assertEqual(post.call_args.kwargs["timeout"], JOB.REQUEST_TIMEOUT)
         slept.assert_called_once_with(JOB.SLEEP_BETWEEN_MEASUREMENTS)
-        self.assertEqual(result, 0.5)
+        self.assertEqual(result, 0.4)
 
     def test_upload_connection_error_returns_zero(self):
         with patch.object(
@@ -93,10 +102,43 @@ class MeasurementTests(unittest.TestCase):
 
         with patch.dict(environ, {"PING_COUNT": "2"}):
             with patch.object(JOB, "ping", side_effect=fake):
-                median_ping, jitter = JOB.calculate_ping()
+                with patch.object(JOB, "sleep") as slept:
+                    median_ping, jitter = JOB.calculate_ping()
 
         self.assertEqual(median_ping, 20.0)
         self.assertEqual(jitter, 20.0)
+        self.assertEqual(slept.call_count, 2)
+        slept.assert_called_with(JOB.PING_RETRY_SECONDS)
+
+    def test_ping_gives_up_when_every_attempt_fails(self):
+        calls = {"n": 0}
+
+        def fake(_host, unit):
+            self.assertEqual(unit, "ms")
+            calls["n"] += 1
+
+        with patch.dict(environ, {"PING_COUNT": "2"}):
+            with patch.object(JOB, "ping", side_effect=fake):
+                with patch.object(JOB, "sleep") as slept:
+                    with self.assertRaises(RuntimeError):
+                        JOB.calculate_ping()
+
+        self.assertEqual(calls["n"], JOB.PING_ATTEMPTS)
+        self.assertEqual(slept.call_count, JOB.PING_ATTEMPTS - 1)
+
+    def test_ping_count_below_two_is_rejected(self):
+        with patch.dict(environ, {"PING_COUNT": "1"}):
+            with patch.object(JOB, "ping") as ping:
+                with self.assertRaises(ValueError):
+                    JOB.calculate_ping()
+        ping.assert_not_called()
+
+    def test_download_timeout_returns_zero(self):
+        with patch.object(JOB, "requests_get", side_effect=JOB.RequestsTimeout("slow")):
+            with patch.object(JOB, "sleep") as slept:
+                result = JOB.download(1000)
+        self.assertEqual(result, 0)
+        slept.assert_not_called()
 
     def test_iteration_counts_use_the_default_or_the_environment(self):
         with patch.dict(environ, {}, clear=False):
