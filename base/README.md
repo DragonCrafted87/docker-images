@@ -1,6 +1,6 @@
 # base
 
-Alpine 3.24 image with Python 3, pip, and tzdata. Other images in this repo build `FROM ghcr.io/dragoncrafted87/alpine:3.24`.
+Alpine 3.24 image with Python 3, pip, and tzdata. `minecraft/`, `ambient-weather-mqtt/`, and `speedtest-mqtt/` build `FROM ghcr.io/dragoncrafted87/alpine:3.24`. `foundry/` and `backup/` start from `alpine:3.24` directly because each has its own entrypoint.
 
 ```sh
 docker build --tag ghcr.io/dragoncrafted87/alpine:3.24 .

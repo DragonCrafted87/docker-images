@@ -1,0 +1,201 @@
+name: images
+
+on:
+  pull_request:
+  push:
+    branches:
+    - main
+    tags:
+    - ambient-weather-mqtt-v*
+    - backup-v*
+    - base-v*
+    - foundry-v*
+    - minecraft-v*
+    - speedtest-mqtt-v*
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Image test packages
+      run: python3 -m venv /tmp/image-tests && /tmp/image-tests/bin/pip install paho-mqtt ping3 requests
+    - name: Base tests
+      run: python3 -m unittest discover -s base/tests -v
+    - name: Minecraft tests
+      run: python3 -m unittest discover -s minecraft/tests -v
+    - name: Weather tests
+      run: /tmp/image-tests/bin/python -m unittest discover -s ambient-weather-mqtt/tests -v
+    - name: Speedtest tests
+      run: /tmp/image-tests/bin/python -m unittest discover -s speedtest-mqtt/tests -v
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Image names
+      id: image
+      run: |
+        owner="${GITHUB_REPOSITORY_OWNER,,}"
+        echo "base=ghcr.io/${owner}/alpine" >> "$GITHUB_OUTPUT"
+        echo "minecraft=ghcr.io/${owner}/alpine-minecraft" >> "$GITHUB_OUTPUT"
+        echo "foundry=ghcr.io/${owner}/alpine-foundry-vtt-runner" >> "$GITHUB_OUTPUT"
+        echo "backup=ghcr.io/${owner}/alpine-backup-cron" >> "$GITHUB_OUTPUT"
+        echo "weather=ghcr.io/${owner}/alpine-ambient-weather-mqtt-publisher" >> "$GITHUB_OUTPUT"
+        echo "speedtest=ghcr.io/${owner}/alpine-speedtest-mqtt-publisher" >> "$GITHUB_OUTPUT"
+    - name: Publish which images
+      id: push
+      run: |
+        base=false
+        minecraft=false
+        foundry=false
+        backup=false
+        weather=false
+        speedtest=false
+        ref="$GITHUB_REF"
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$ref" = "refs/heads/main" ]; then
+        base=true
+        minecraft=true
+        foundry=true
+        backup=true
+        weather=true
+        speedtest=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/base-v}" != "$ref" ]; then
+        base=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/minecraft-v}" != "$ref" ]; then
+        minecraft=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/foundry-v}" != "$ref" ]; then
+        foundry=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/backup-v}" != "$ref" ]; then
+        backup=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/ambient-weather-mqtt-v}" != "$ref" ]; then
+        weather=true
+        fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/speedtest-mqtt-v}" != "$ref" ]; then
+        speedtest=true
+        fi
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        echo "minecraft=$minecraft" >> "$GITHUB_OUTPUT"
+        echo "foundry=$foundry" >> "$GITHUB_OUTPUT"
+        echo "backup=$backup" >> "$GITHUB_OUTPUT"
+        echo "weather=$weather" >> "$GITHUB_OUTPUT"
+        echo "speedtest=$speedtest" >> "$GITHUB_OUTPUT"
+    - name: Base meta
+      id: base-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.base }}
+        bake-target: base-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=raw,value=3.24,enable={{is_default_branch}}
+          type=edge,branch=main
+          type=match,pattern=base-v(.*),group=1
+          type=sha
+    - name: Minecraft meta
+      id: minecraft-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.minecraft }}
+        bake-target: minecraft-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=minecraft-v(.*),group=1
+          type=sha
+    - name: Foundry meta
+      id: foundry-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.foundry }}
+        bake-target: foundry-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=foundry-v(.*),group=1
+          type=sha
+    - name: Backup meta
+      id: backup-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.backup }}
+        bake-target: backup-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=backup-v(.*),group=1
+          type=sha
+    - name: Weather meta
+      id: weather-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.weather }}
+        bake-target: ambient-weather-mqtt-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=ambient-weather-mqtt-v(.*),group=1
+          type=sha
+    - name: Speedtest meta
+      id: speedtest-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.speedtest }}
+        bake-target: speedtest-mqtt-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=speedtest-mqtt-v(.*),group=1
+          type=sha
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Login to GHCR
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build
+      uses: docker/bake-action@v6
+      env:
+        PUSH_AMBIENT_WEATHER: ${{ steps.push.outputs.weather }}
+        PUSH_BACKUP: ${{ steps.push.outputs.backup }}
+        PUSH_BASE: ${{ steps.push.outputs.base }}
+        PUSH_FOUNDRY: ${{ steps.push.outputs.foundry }}
+        PUSH_MINECRAFT: ${{ steps.push.outputs.minecraft }}
+        PUSH_SPEEDTEST: ${{ steps.push.outputs.speedtest }}
+      with:
+        source: .
+        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt
+        files: |
+          ./docker-bake.hcl
+          cwd://${{ steps.base-meta.outputs.bake-file }}
+          cwd://${{ steps.minecraft-meta.outputs.bake-file }}
+          cwd://${{ steps.foundry-meta.outputs.bake-file }}
+          cwd://${{ steps.backup-meta.outputs.bake-file }}
+          cwd://${{ steps.weather-meta.outputs.bake-file }}
+          cwd://${{ steps.speedtest-meta.outputs.bake-file }}

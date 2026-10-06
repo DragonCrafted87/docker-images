@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+base_backup_name="${BACKUP_NAME:-minecraft-vanillaplusplus-backup}"
+# Same stamp as the old job: ISO year, ISO week, ISO weekday, hour, minute, second.
+date_stamp="$(date +%G-W%V-%u-%H-%M-%S)"
+backup_name="${base_backup_name}-${date_stamp}.tar.xz"
+source_path=/mnt/source
+temp_path=/mnt/tmp
+dest_dir=/mnt/backups
+create_path="/mnt/${backup_name}"
+
+rm -rf "$temp_path"
+mkdir -p "$temp_path" "$dest_dir"
+
+# Follow links. The old job used copy_tree, which copies the link target.
+cp -R -L "${source_path}/." "$temp_path/"
+
+tar -C "$temp_path" -cJf "$create_path" .
+mv "$create_path" "${dest_dir}/${backup_name}"
