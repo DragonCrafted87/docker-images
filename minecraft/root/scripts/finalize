@@ -1,0 +1,434 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+# System Imports
+from logging import ERROR
+from logging import INFO
+from multiprocessing import Process
+from os import _exit as exit_now
+from os import chdir
+from os import close as os_close
+from os import fdopen
+from os import getenv
+from os import pipe as os_pipe
+from os import remove
+from pathlib import Path
+from pathlib import PurePath
+from pickle import dump as pickle_dump
+from pickle import load as pickle_load
+from signal import SIGABRT
+from signal import SIGINT
+from signal import SIGTERM
+from signal import signal
+from subprocess import PIPE
+from subprocess import Popen
+from subprocess import run
+from threading import Thread
+from time import sleep
+
+# Local Imports
+from includes.fabric import fetch  # pylint: disable=no-name-in-module
+from includes.fabric import release_version  # pylint: disable=no-name-in-module
+from includes.python_logger import create_logger  # pylint: disable=no-name-in-module
+
+RAM_DRIVE = "/mnt/ramdisk/"
+NFS_DRIVE = "/mnt/minecraft/"
+DATA_STORE = "/mnt/minecraft/store.pckl"
+SAVE_INTERVAL = 300
+
+FOLDER_LIST = []
+FOLDER_LIST.append("world")
+FOLDER_LIST.append("config")
+
+FILE_LIST = []
+FILE_LIST.append("banned-ips.json")
+FILE_LIST.append("banned-players.json")
+FILE_LIST.append("ops.json")
+FILE_LIST.append("server.properties")
+FILE_LIST.append("whitelist.json")
+
+
+class LogPipe(Thread):  # pylint: disable=too-many-instance-attributes
+    def __init__(self, base_logger, level):
+        # pylint: disable=invalid-name
+        """Setup the object with a logger and a log level
+        and start the thread
+        """
+        Thread.__init__(self)
+        self.daemon = True
+        self.level = level
+        self.fdRead, self.fdWrite = os_pipe()
+        self.pipeReader = fdopen(self.fdRead)
+        self.base_logger = base_logger
+        self._watch_for_value = False
+        self._watched_value = None
+        self._watched_values = []
+        self.watched_value_found = False
+        self.start()
+
+    def fileno(self):
+        """Return the write file descriptor of the pipe"""
+        return self.fdWrite
+
+    def run(self):
+        """Run the thread, logging everything."""
+        for line in iter(self.pipeReader.readline, ""):
+            clean_line = line.strip("\n")
+            if self._watch_for_value:
+                if any(substring in clean_line for substring in self._watched_values):
+                    self.watched_value_found = True
+            self.base_logger.log(self.level, clean_line)
+
+        self.pipeReader.close()
+
+    def close(self):
+        """Close the write end of the pipe."""
+        os_close(self.fdWrite)
+
+    def watch_for_value(self, *watch_values):
+        """Setup Watched Value."""
+        if watch_values:
+            self._watch_for_value = True
+            self._watched_values = list(watch_values)
+        else:
+            self._watch_for_value = False
+            self._watched_value = None
+        self.watched_value_found = False
+
+
+LOGGER = create_logger(PurePath(__file__).stem)
+LOGINFO = LogPipe(LOGGER, INFO)
+LOGERR = LogPipe(LOGGER, ERROR)
+
+LOGGER.setLevel(INFO)
+
+
+CHILD_PROCESS = None
+
+
+def copy_directory_to_storage(sub_path):
+    from dirsync import sync
+
+    try:
+        sync(
+            f"{RAM_DRIVE}{sub_path}",
+            f"{NFS_DRIVE}{sub_path}",
+            "sync",
+            logger=LOGGER,
+            verbose=True,
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
+def copy_files_to_storage():
+    from dirsync import sync
+
+    try:
+        sync(
+            RAM_DRIVE,
+            NFS_DRIVE,
+            "sync",
+            logger=LOGGER,
+            verbose=True,
+            only=FILE_LIST,
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
+def sync_copy(ram_to_data_store=True):
+    from dirsync import sync
+
+    try:
+        if ram_to_data_store:
+            for folder in FOLDER_LIST:
+                copy_directory_to_storage(folder)
+            copy_files_to_storage()
+        else:
+            sync(
+                NFS_DRIVE,
+                RAM_DRIVE,
+                "sync",
+                logger=LOGGER,
+                verbose=True,
+            )
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
+def save(process):
+    if process.poll() is None:
+        process.stdin.write(b"save-off\n")
+        process.stdin.flush()
+        process.stdin.write(b"save-all\n")
+        process.stdin.flush()
+
+        LOGINFO.watch_for_value("Saved the game", "RCON Listener stopped")
+        counter = 0
+        while not LOGINFO.watched_value_found and counter < 90:
+            sleep(1)
+            counter = counter + 1
+
+        save_process = Process(target=sync_copy)
+
+        save_process.start()
+        save_process.join(timeout=5000)
+
+        if save_process.is_alive():
+            save_process.kill()
+            LOGGER.error("Sync Timed Out Stopping Minecraft Server")
+            process.stdin.write(b"stop\n")
+            process.stdin.flush()
+        else:
+            process.stdin.write(b"save-on\n")
+            process.stdin.flush()
+
+
+def shutdown(process, exit_fn=exit_now):
+    if process is None:
+        LOGGER.info("Server never started")
+        LOGINFO.close()
+        LOGERR.close()
+        exit_fn(0)
+        return  # pylint: disable=unreachable
+
+    LOGGER.info("Starting Final Sync")
+    if process.poll() is None:
+        process.stdin.write(b"stop\n")
+        process.stdin.flush()
+
+        counter = 0
+        LOGINFO.watch_for_value("RCON Listener stopped")
+        while not LOGINFO.watched_value_found and counter < 30:
+            sleep(1)
+            counter = counter + 1
+
+    save_process = Process(target=sync_copy)
+
+    save_process.start()
+    save_process.join(timeout=5000)
+
+    if save_process.is_alive():
+        save_process.kill()
+        LOGGER.error("Final Sync Timed out")
+    else:
+        LOGGER.info("Finished Final Sync")
+
+    LOGINFO.close()
+    LOGERR.close()
+
+    exit_code = process.poll()
+    if exit_code is None:
+        process.kill()
+        exit_code = 9999
+
+    exit_fn(exit_code)
+
+
+def save_and_exit():
+    shutdown(CHILD_PROCESS)
+
+
+def exit_after_failure(process, exit_fn=exit_now):
+    if process is None:
+        LOGINFO.close()
+        LOGERR.close()
+        exit_fn(1)
+        return  # pylint: disable=unreachable
+    shutdown(process, exit_fn=exit_fn)
+
+
+def signal_handler(_sig, _frame):
+    save_and_exit()
+
+
+def log_retry(url, attempt, attempts, error, delay):
+    LOGGER.warning(
+        "Fetch %s failed (%s/%s): %s; retrying in %ss",
+        url,
+        attempt,
+        attempts,
+        error,
+        delay,
+    )
+
+
+def install_fabric(minecraft_version):
+    from requests import get as http_get
+    from xmltodict import parse as xml_parse
+
+    fabric_base_url = "https://maven.fabricmc.net/net/fabricmc/fabric-installer/"
+    fabric_metadata_url = f"{fabric_base_url}maven-metadata.xml"
+
+    metadata = fetch(
+        fabric_metadata_url,
+        get=http_get,
+        sleep=sleep,
+        log=log_retry,
+    )
+    fabric_version = release_version(xml_parse(metadata.content))
+
+    fabric_download_url = (
+        f"{fabric_base_url}{fabric_version}/fabric-installer-{fabric_version}.jar"
+    )
+    fabric_download = fetch(
+        fabric_download_url,
+        get=http_get,
+        sleep=sleep,
+        log=log_retry,
+    )
+
+    fabric_installer = Path(f"{RAM_DRIVE}fabric-installer.jar")
+    LOGGER.info(fabric_installer)
+    with open(fabric_installer, "wb") as installer:
+        installer.write(fabric_download.content)
+
+    if fabric_installer.is_file():
+        chdir(RAM_DRIVE)
+        fabric_install_script = []
+        fabric_install_script.append("/usr/bin/java")
+        fabric_install_script.append("-jar")
+        fabric_install_script.append(f"{RAM_DRIVE}fabric-installer.jar")
+        fabric_install_script.append("server")
+        fabric_install_script.append("-mcversion")
+        fabric_install_script.append(f"{minecraft_version}")
+        fabric_install_script.append("-downloadMinecraft")
+        fabric_install_script.append("-dir")
+        fabric_install_script.append(f"{RAM_DRIVE}")
+
+        LOGGER.info(fabric_install_script)
+
+        fabric_install = Popen(  # pylint: disable=consider-using-with
+            fabric_install_script, stdin=PIPE, stdout=LOGINFO, stderr=LOGERR
+        )
+        fabric_install.wait()
+        remove("fabric-installer.jar")
+
+
+def start_minecraft(version_change=False):
+    chdir(RAM_DRIVE)
+
+    raw_ram_string = (
+        run("/usr/bin/free", stdout=PIPE, check=True)
+        .stdout.decode("utf-8")
+        .split("\n")[1]
+        .split()[1]
+    )
+
+    total_ram = int(raw_ram_string) / 1000000
+    minecraft_ram = int(total_ram * 0.25)
+
+    LOGGER.info("Using %sG RAM for Minecraft", minecraft_ram)
+
+    # https://aikar.co/2018/07/02/tuning-the-jvm-g1gc-garbage-collector-flags-for-minecraft/
+    start_server_script = []
+    start_server_script.append("/usr/bin/java")
+    start_server_script.append(f"-Xms{minecraft_ram}G")
+    start_server_script.append(f"-Xmx{minecraft_ram}G")
+    start_server_script.append("-XX:+UseG1GC")
+    start_server_script.append("-XX:+ParallelRefProcEnabled")
+    start_server_script.append("-XX:MaxGCPauseMillis=200")
+    start_server_script.append("-XX:+UnlockExperimentalVMOptions")
+    start_server_script.append("-XX:+DisableExplicitGC")
+    start_server_script.append("-XX:+AlwaysPreTouch")
+
+    if minecraft_ram > 12:
+        start_server_script.append("-XX:G1NewSizePercent=40")
+        start_server_script.append("-XX:G1MaxNewSizePercent=50")
+        start_server_script.append("-XX:G1HeapRegionSize=16M")
+        start_server_script.append("-XX:G1ReservePercent=15")
+    else:
+        start_server_script.append("-XX:G1NewSizePercent=30")
+        start_server_script.append("-XX:G1MaxNewSizePercent=40")
+        start_server_script.append("-XX:G1HeapRegionSize=8M")
+        start_server_script.append("-XX:G1ReservePercent=20")
+
+    start_server_script.append("-XX:G1HeapWastePercent=5")
+    start_server_script.append("-XX:G1MixedGCCountTarget=4")
+
+    if minecraft_ram > 12:
+        start_server_script.append("-XX:InitiatingHeapOccupancyPercent=20")
+    else:
+        start_server_script.append("-XX:InitiatingHeapOccupancyPercent=15")
+
+    start_server_script.append("-XX:G1MixedGCLiveThresholdPercent=90")
+    start_server_script.append("-XX:G1RSetUpdatingPauseTimePercent=5")
+    start_server_script.append("-XX:SurvivorRatio=32")
+    start_server_script.append("-XX:+PerfDisableSharedMem")
+    start_server_script.append("-XX:MaxTenuringThreshold=1")
+    start_server_script.append("-Dusing.aikars.flags=https://mcflags.emc.gs")
+    start_server_script.append("-Daikars.new.flags=true")
+    start_server_script.append("-jar")
+
+    # Minecraft Commands
+    start_server_script.append(f"{RAM_DRIVE}fabric-server-launch.jar")
+    start_server_script.append("--nogui")
+    if version_change:
+        # clear the lighting cache
+        start_server_script.append("--eraseCache")
+        # Upgrade all Chunks
+        start_server_script.append("--forceUpgrade")
+
+    return Popen(  # pylint: disable=consider-using-with
+        start_server_script, stdin=PIPE, stdout=LOGINFO, stderr=LOGERR
+    )
+
+
+def main():
+    signal(SIGINT, signal_handler)
+    signal(SIGABRT, signal_handler)
+    signal(SIGTERM, signal_handler)
+
+    minecraft_version = getenv("MINECRAFT_VERSION", "1.17")
+    version_change = True
+    try:
+        with open(DATA_STORE, "rb") as store:
+            previous_minecraft_version = pickle_load(store)
+            version_change = minecraft_version != previous_minecraft_version
+    except OSError:
+        LOGGER.info("Failed to find previous Minecraft Version")
+
+    if version_change:
+        with open(DATA_STORE, "wb") as store:
+            pickle_dump(minecraft_version, store)
+
+    install_fabric(minecraft_version)
+
+    sync_copy(ram_to_data_store=False)
+
+    global CHILD_PROCESS  # pylint: disable=global-statement
+    CHILD_PROCESS = start_minecraft(version_change)
+
+    # Wait until RCON is up, or for SAVE_INTERVAL tries, so a version
+    # upgrade can finish rewriting chunks.
+    counter = 0
+    LOGINFO.watch_for_value("RCON running")
+    while CHILD_PROCESS.poll() is None:
+        counter = counter + 1
+        if counter > SAVE_INTERVAL or LOGINFO.watched_value_found:
+            break
+        sleep(5)
+
+    # save every SAVE_INTERVAL seconds
+    counter = 0
+    LOGINFO.watch_for_value("RCON Listener stopped")
+    while CHILD_PROCESS.poll() is None and not LOGINFO.watched_value_found:
+        if counter > SAVE_INTERVAL:
+            save(CHILD_PROCESS)
+            LOGINFO.watch_for_value("RCON Listener stopped")
+            counter = 0
+        else:
+            counter = counter + 1
+
+        sleep(1)
+
+    save_and_exit()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("Minecraft startup failed")
+        exit_after_failure(CHILD_PROCESS)
