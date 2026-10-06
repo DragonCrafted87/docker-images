@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+from datetime import datetime
+from datetime import timezone
+from json import dumps as dump_to_json
+from urllib.parse import parse_qs
+from wsgiref.simple_server import make_server
+
+from includes.mqtt import publish  # pylint: disable=no-name-in-module
+
+
+def convert_value(value):
+    if len(value) == 1:
+        return value[0]
+    return value
+
+
+def listener(environ, start_response):
+    if "AMBWeather" in environ["PATH_INFO"]:
+        data_dict = parse_qs("http://" + environ["HTTP_HOST"] + environ["PATH_INFO"])
+
+        keys_list = list(data_dict.keys())
+        for key in keys_list:
+            if "/" in key:
+                value = convert_value(data_dict[key])
+                field = key[key.rfind("/") + 1 :]
+
+                data_dict.pop(key)
+                data_dict[field] = value
+            else:
+                data_dict[key] = convert_value(data_dict[key])
+
+        utc = datetime.strptime(data_dict.pop("dateutc"), "%Y-%m-%d %H:%M:%S")
+        utc = utc.replace(tzinfo=timezone.utc)
+        local_time = utc.astimezone()
+
+        time_string_payload = local_time.strftime("%Y-%m-%d %H:%M:%S")
+        json_payload = dump_to_json(data_dict)
+
+        publish("weather", time_string_payload)
+        publish("weather/attributes", json_payload)
+
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        response_body = ""
+        return [response_body.encode()]
+
+    start_response("400 Bad Request", [("Content-Type", "text/plain")])
+    response_body = ""
+    return [response_body.encode()]
+
+
+def main():
+    httpd = make_server("", 80, listener)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
