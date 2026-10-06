@@ -181,6 +181,13 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     - name: Build
       uses: docker/bake-action@v6
+      env:
+        PUSH_AMBIENT_WEATHER: ${{ steps.push.outputs.weather }}
+        PUSH_BACKUP: ${{ steps.push.outputs.backup }}
+        PUSH_BASE: ${{ steps.push.outputs.base }}
+        PUSH_FOUNDRY: ${{ steps.push.outputs.foundry }}
+        PUSH_MINECRAFT: ${{ steps.push.outputs.minecraft }}
+        PUSH_SPEEDTEST: ${{ steps.push.outputs.speedtest }}
       with:
         source: .
         targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt
@@ -192,10 +199,3 @@ jobs:
           cwd://${{ steps.backup-meta.outputs.bake-file }}
           cwd://${{ steps.weather-meta.outputs.bake-file }}
           cwd://${{ steps.speedtest-meta.outputs.bake-file }}
-        set: |
-          PUSH_BASE=${{ steps.push.outputs.base }}
-          PUSH_MINECRAFT=${{ steps.push.outputs.minecraft }}
-          PUSH_FOUNDRY=${{ steps.push.outputs.foundry }}
-          PUSH_BACKUP=${{ steps.push.outputs.backup }}
-          PUSH_AMBIENT_WEATHER=${{ steps.push.outputs.weather }}
-          PUSH_SPEEDTEST=${{ steps.push.outputs.speedtest }}
