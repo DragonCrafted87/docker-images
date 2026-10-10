@@ -105,7 +105,9 @@ write_snapshot() {
         printf 'temp %s\n' "$best" >>"$dest"
     fi
 
-    route_path=$(sample_path proc/net/route || true)
+    # /proc/net follows the reader. PID 1 stays on the host network
+    # when /proc is a bind mount, which is how the DaemonSet reads it.
+    route_path=$(sample_path proc/1/net/route || sample_path proc/net/route || true)
     if [ -n "$route_path" ]; then
         primary=$(awk '
             NR > 1 && $2 == "00000000" {
@@ -126,7 +128,7 @@ write_snapshot() {
         fi
     fi
 
-    dev_path=$(sample_path proc/net/dev || true)
+    dev_path=$(sample_path proc/1/net/dev || sample_path proc/net/dev || true)
     if [ -n "$dev_path" ]; then
         awk '$1 ~ /:$/ {
             name = $1

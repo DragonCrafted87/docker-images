@@ -97,6 +97,31 @@ write_cpu "$base" "100 0 0 900 0 0 0 0 0 0" "350 0 0 1650 0 0 0 0 0 0"
 printf 'MemTotal: 1000000 kB\nMemFree: 100000 kB\nMemAvailable: 600000 kB\nBuffers: 0 kB\nCached: 0 kB\n' >"$base/proc/meminfo"
 payload=$(run_script "$base" 1)
 assert_json "$payload"
+primary_net=$(mktemp -d)
+trap 'rm -rf "$fake" "$base" "$primary_net"' EXIT
+mkdir -p "$primary_net/proc/1/net" "$primary_net/proc/net"
+write_cpu "$primary_net" "100 0 0 900 0 0 0 0 0 0" "350 0 0 1650 0 0 0 0 0 0"
+printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' >"$primary_net/proc/meminfo"
+write_dev "$primary_net/proc/1/net/dev.1" eth2 1000 2000
+write_dev "$primary_net/proc/1/net/dev.2" eth2 3000 4000
+printf 'Iface Destination Gateway Flags RefCnt Use Metric Mask\neth2 00000000 0100000A 0003 0 0 100 00000000\n' >"$primary_net/proc/1/net/route"
+write_dev "$primary_net/proc/net/dev.1" eth0 1000 2000
+write_dev "$primary_net/proc/net/dev.2" eth0 9000 9000
+printf 'Iface Destination Gateway Flags RefCnt Use Metric Mask\neth0 00000000 0100000A 0003 0 0 100 00000000\n' >"$primary_net/proc/net/route"
+primary_net_payload=$(run_script "$primary_net" 1)
+python3 - "$primary_net_payload" <<'PY'
+import json
+import sys
+data = json.loads(sys.argv[1])
+names = [item["name"] for item in data["net"]]
+assert data["primary"] == "eth2", data
+assert names == ["eth2"], names
+assert data["rx_bps"] == 2000, data
+assert data["tx_bps"] == 2000, data
+PY
+printf 'host network\n'
+rm -rf "$primary_net"
+
 printf 'included eth0\n'
 printf 'included eth1\n'
 printf 'included br-lan\n'
