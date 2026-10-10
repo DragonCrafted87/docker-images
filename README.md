@@ -37,3 +37,9 @@ A tag `ambient-weather-mqtt-v2.1.0` publishes the image as `2.1.0`. Pushes to `m
 `speedtest-mqtt/` builds `ghcr.io/dragoncrafted87/alpine-speedtest-mqtt-publisher` from the base image. The setup script measures the link, publishes the result to MQTT, and the container exits.
 
 A tag `speedtest-mqtt-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publish `edge`.
+
+## host-status
+
+`host-status/` builds `ghcr.io/dragoncrafted87/alpine-host-status` from Alpine 3.24. It publishes CPU, memory, temperature, and default-route rates to MQTT.
+
+A tag `host-status-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publish `edge`.

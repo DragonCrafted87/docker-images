@@ -12,6 +12,7 @@ on:
     - foundry-v*
     - minecraft-v*
     - speedtest-mqtt-v*
+    - host-status-v*
 
 jobs:
   test:
@@ -53,6 +54,7 @@ jobs:
         echo "backup=ghcr.io/${owner}/alpine-backup-cron" >> "$GITHUB_OUTPUT"
         echo "weather=ghcr.io/${owner}/alpine-ambient-weather-mqtt-publisher" >> "$GITHUB_OUTPUT"
         echo "speedtest=ghcr.io/${owner}/alpine-speedtest-mqtt-publisher" >> "$GITHUB_OUTPUT"
+        echo "host_status=ghcr.io/${owner}/alpine-host-status" >> "$GITHUB_OUTPUT"
     - name: Publish which images
       id: push
       run: |
@@ -62,6 +64,7 @@ jobs:
         backup=false
         weather=false
         speedtest=false
+        host_status=false
         ref="$GITHUB_REF"
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$ref" = "refs/heads/main" ]; then
         base=true
@@ -70,6 +73,7 @@ jobs:
         backup=true
         weather=true
         speedtest=true
+        host_status=true
         fi
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/base-v}" != "$ref" ]; then
         base=true
@@ -89,12 +93,16 @@ jobs:
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/speedtest-mqtt-v}" != "$ref" ]; then
         speedtest=true
         fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/host-status-v}" != "$ref" ]; then
+        host_status=true
+        fi
         echo "base=$base" >> "$GITHUB_OUTPUT"
         echo "minecraft=$minecraft" >> "$GITHUB_OUTPUT"
         echo "foundry=$foundry" >> "$GITHUB_OUTPUT"
         echo "backup=$backup" >> "$GITHUB_OUTPUT"
         echo "weather=$weather" >> "$GITHUB_OUTPUT"
         echo "speedtest=$speedtest" >> "$GITHUB_OUTPUT"
+        echo "host_status=$host_status" >> "$GITHUB_OUTPUT"
     - name: Base meta
       id: base-meta
       uses: docker/metadata-action@v5
@@ -168,6 +176,18 @@ jobs:
           type=edge,branch=main
           type=match,pattern=speedtest-mqtt-v(.*),group=1
           type=sha
+    - name: Host status meta
+      id: host-status-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.host_status }}
+        bake-target: host-status-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=host-status-v(.*),group=1
+          type=sha
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
@@ -188,9 +208,10 @@ jobs:
         PUSH_FOUNDRY: ${{ steps.push.outputs.foundry }}
         PUSH_MINECRAFT: ${{ steps.push.outputs.minecraft }}
         PUSH_SPEEDTEST: ${{ steps.push.outputs.speedtest }}
+        PUSH_HOST_STATUS: ${{ steps.push.outputs.host_status }}
       with:
         source: .
-        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt
+        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt,host-status
         files: |
           ./docker-bake.hcl
           cwd://${{ steps.base-meta.outputs.bake-file }}
@@ -199,3 +220,4 @@ jobs:
           cwd://${{ steps.backup-meta.outputs.bake-file }}
           cwd://${{ steps.weather-meta.outputs.bake-file }}
           cwd://${{ steps.speedtest-meta.outputs.bake-file }}
+          cwd://${{ steps.host-status-meta.outputs.bake-file }}
