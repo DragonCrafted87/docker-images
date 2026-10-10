@@ -22,8 +22,12 @@ variable "PUSH_SPEEDTEST" {
   default = "false"
 }
 
+variable "PUSH_HOST_STATUS" {
+  default = "false"
+}
+
 group "default" {
-  targets = ["base", "minecraft", "foundry", "backup", "ambient-weather-mqtt", "speedtest-mqtt"]
+  targets = ["base", "minecraft", "foundry", "backup", "ambient-weather-mqtt", "speedtest-mqtt", "host-status"]
 }
 
 target "base-meta" {}
@@ -37,6 +41,8 @@ target "backup-meta" {}
 target "ambient-weather-mqtt-meta" {}
 
 target "speedtest-mqtt-meta" {}
+
+target "host-status-meta" {}
 
 target "base" {
   inherits = ["base-meta"]
@@ -96,4 +102,11 @@ target "speedtest-mqtt" {
   }
   platforms = ["linux/amd64", "linux/arm64"]
   output = PUSH_SPEEDTEST == "true" ? ["type=registry"] : ["type=cacheonly"]
+}
+
+target "host-status" {
+  inherits = ["host-status-meta"]
+  context = "host-status"
+  platforms = ["linux/amd64", "linux/arm64"]
+  output = PUSH_HOST_STATUS == "true" ? ["type=registry"] : ["type=cacheonly"]
 }
