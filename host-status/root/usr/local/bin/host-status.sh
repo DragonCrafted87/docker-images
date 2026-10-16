@@ -84,17 +84,22 @@ write_snapshot() {
             continue
         fi
         raw=$(tr -d '[:space:]' <"$zone/temp")
-        case $raw in
+        sign=1
+        magnitude=$raw
+        case $magnitude in
+            -*)
+                sign=-1
+                magnitude=${magnitude#-}
+                ;;
+        esac
+        case $magnitude in
             ''|*[!0-9]*)
                 continue
                 ;;
         esac
-        if [ "$raw" -gt 1000 ]; then
-            tenths=$((raw / 100))
-        else
-            tenths=$((raw * 10))
-        fi
-        if [ "$tenths" -le 0 ] || [ "$tenths" -gt 1500 ]; then
+        # The kernel writes this file as thousandths of a degree Celsius.
+        tenths=$((sign * (magnitude / 100)))
+        if [ "$tenths" -gt 1500 ]; then
             continue
         fi
         if [ -z "$best" ] || [ "$tenths" -gt "$best" ]; then
@@ -201,9 +206,17 @@ emit_payload() {
                 }
             }
             if (have_temp) {
-                whole = int(tenths / 10)
-                frac = tenths % 10
-                temp_json = sprintf("%d.%d", whole, frac)
+                abs_tenths = tenths
+                if (abs_tenths < 0) {
+                    abs_tenths = -abs_tenths
+                }
+                whole = int(abs_tenths / 10)
+                frac = abs_tenths % 10
+                if (tenths < 0) {
+                    temp_json = sprintf("-%d.%d", whole, frac)
+                } else {
+                    temp_json = sprintf("%d.%d", whole, frac)
+                }
             } else {
                 temp_json = "null"
             }

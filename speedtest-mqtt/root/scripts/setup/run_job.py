@@ -16,6 +16,7 @@ from ping3 import ping
 from requests import get as requests_get
 from requests import post as requests_post
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError as RequestsHTTPError
 from requests.exceptions import Timeout as RequestsTimeout
 
 LOGGER = create_logger(PurePath(__file__).stem)
@@ -39,17 +40,18 @@ MEASUREMENT_SIZES = [
 def download(download_bytes):
     try:
         start_time = time()
-        _ = requests_get(
+        response = requests_get(
             f"https://speed.cloudflare.com/__down?bytes={download_bytes}",
             timeout=REQUEST_TIMEOUT,
         )
         finish_time = time()
+        response.raise_for_status()
 
         sleep(SLEEP_BETWEEN_MEASUREMENTS)
 
         duration = finish_time - start_time
-        measurement = megabits_per_second(download_bytes, duration)
-    except (RequestsConnectionError, RequestsTimeout):
+        measurement = megabits_per_second(len(response.content), duration)
+    except (RequestsConnectionError, RequestsTimeout, RequestsHTTPError):
         measurement = 0
 
     return measurement
@@ -63,18 +65,19 @@ def upload(upload_bytes):
     try:
         upload_data = bytearray(upload_bytes)
         start_time = time()
-        _ = requests_post(
+        response = requests_post(
             "https://speed.cloudflare.com/__up",
             data=upload_data,
             timeout=REQUEST_TIMEOUT,
         )
         finish_time = time()
+        response.raise_for_status()
 
         sleep(SLEEP_BETWEEN_MEASUREMENTS)
 
         duration = finish_time - start_time
-        measurement = megabits_per_second(upload_bytes, duration)
-    except (RequestsConnectionError, RequestsTimeout):
+        measurement = megabits_per_second(len(upload_data), duration)
+    except (RequestsConnectionError, RequestsTimeout, RequestsHTTPError):
         measurement = 0
 
     return measurement
