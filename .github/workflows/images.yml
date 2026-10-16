@@ -34,6 +34,14 @@ jobs:
       run: /tmp/image-tests/bin/python -m unittest discover -s ambient-weather-mqtt/tests -v
     - name: Speedtest tests
       run: /tmp/image-tests/bin/python -m unittest discover -s speedtest-mqtt/tests -v
+    - name: Host status tests
+      run: bash host-status/host-status-test.sh
+    - name: Foundry prove
+      run: bash foundry/prove.sh
+    - name: Backup prove
+      run: bash backup/prove.sh
+    - name: Host status prove
+      run: bash host-status/prove.sh
 
   build:
     needs: test

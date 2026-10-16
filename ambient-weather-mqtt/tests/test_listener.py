@@ -96,6 +96,35 @@ class ListenerTests(unittest.TestCase):
             ],
         )
 
+    def test_station_secrets_are_not_published(self):
+        started = []
+
+        def start_response(code, headers):
+            started.append((code, headers))
+
+        with patch.object(FINALIZE, "publish") as send:
+            FINALIZE.listener(
+                {
+                    "PATH_INFO": "/data/report/",
+                    "QUERY_STRING": (
+                        "PASSKEY=station-secret&PASSWORD=other-secret"
+                        "&stationtype=AMBWeatherV4.3.7"
+                        "&dateutc=2024-01-02+03:04:05&tempf=70.1"
+                    ),
+                },
+                start_response,
+            )
+
+        self.assertEqual(started, [("200 OK", [("Content-Type", "text/plain")])])
+        attributes = send.call_args_list[1].args[1]
+        self.assertNotIn("station-secret", attributes)
+        self.assertNotIn("PASSKEY", attributes)
+        self.assertNotIn("other-secret", attributes)
+        self.assertEqual(
+            json.loads(attributes),
+            {"stationtype": "AMBWeatherV4.3.7", "tempf": "70.1"},
+        )
+
     def test_unrelated_query_is_bad_request(self):
         started = []
 

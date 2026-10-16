@@ -14,6 +14,7 @@ from os import pipe as os_pipe
 from os import remove
 from pathlib import Path
 from pathlib import PurePath
+from pickle import UnpicklingError
 from pickle import dump as pickle_dump
 from pickle import load as pickle_load
 from signal import SIGABRT
@@ -54,9 +55,10 @@ FILE_LIST.append("server.properties")
 FILE_LIST.append("whitelist.json")
 
 # free reports KiB. "max" and the v1 sentinel both mean the cgroup limit is unset.
+# Java's G suffix is 1024 KiB, so the heap math uses that unit.
 CGROUP_V2_MAX = "/sys/fs/cgroup/memory.max"
 CGROUP_V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-ONE_GB_IN_FREE_UNITS = 1_000_000
+ONE_G = 1024 * 1024
 UNLIMITED_CGROUP_BYTES = 1 << 60
 
 
@@ -85,11 +87,17 @@ def memory_limit_kb(read_text, read_free_kb):
 
 
 def heap_gigabytes(limit_kb):
-    if limit_kb < ONE_GB_IN_FREE_UNITS:
+    if limit_kb < ONE_G:
         raise RuntimeError(
-            f"Refusing to start: memory limit {limit_kb} kB is under 1 GB"
+            f"Refusing to start: memory limit {limit_kb} kB is under 1 GiB"
         )
-    return max(1, int((limit_kb / ONE_GB_IN_FREE_UNITS) * 0.25))
+    quarter = int((limit_kb / ONE_G) * 0.25)
+    heap = max(1, quarter)
+    if heap * ONE_G >= limit_kb:
+        raise RuntimeError(
+            f"Refusing to start: memory limit {limit_kb} kB cannot hold a {heap} GiB heap"
+        )
+    return heap
 
 
 class LogPipe(Thread):  # pylint: disable=too-many-instance-attributes
@@ -360,6 +368,8 @@ def install_fabric(minecraft_version):
         )
         fabric_install.wait()
         remove("fabric-installer.jar")
+        if fabric_install.returncode != 0:
+            raise RuntimeError(f"Fabric installer exited {fabric_install.returncode}")
 
 
 def start_minecraft(version_change=False):
@@ -432,6 +442,42 @@ def accept_eula():
     )
 
 
+def property_value(path, key):
+    prefix = f"{key}="
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix) :]
+    return None
+
+
+def write_property(path, key, value):
+    prefix = f"{key}="
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    rewritten = []
+    found = False
+    for line in lines:
+        if line.startswith(prefix):
+            rewritten.append(f"{prefix}{value}")
+            found = True
+        else:
+            rewritten.append(line)
+    if not found:
+        rewritten.append(f"{prefix}{value}")
+    path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+
+def enable_rcon():
+    path = Path(RAM_DRIVE) / "server.properties"
+    password = property_value(path, "rcon.password")
+    if not password:
+        password = getenv("RCON_PASSWORD", "minecraft")
+    write_property(path, "enable-rcon", "true")
+    write_property(path, "rcon.port", "25575")
+    write_property(path, "rcon.password", password)
+
+
 def remember_version(version):
     with open(DATA_STORE, "wb") as store:
         pickle_dump(version, store)
@@ -469,13 +515,13 @@ def main():
         with open(DATA_STORE, "rb") as store:
             previous_minecraft_version = pickle_load(store)
             version_change = minecraft_version != previous_minecraft_version
-    except OSError:
+    except (OSError, EOFError, UnpicklingError):
         LOGGER.info("Failed to find previous Minecraft Version")
 
-    install_fabric(minecraft_version)
-
     sync_copy(ram_to_data_store=False)
+    install_fabric(minecraft_version)
     accept_eula()
+    enable_rcon()
 
     global CHILD_PROCESS  # pylint: disable=global-statement
     CHILD_PROCESS = start_minecraft(version_change)

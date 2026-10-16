@@ -206,6 +206,48 @@ class ReleaseVersionTests(unittest.TestCase):
             release_version(None)
 
 
+class InstallerTests(unittest.TestCase):
+    def run_install(self, returncode):
+        process = Mock()
+        process.returncode = returncode
+        metadata = Mock(content=b"<metadata></metadata>")
+        downloaded = Mock(content=b"jar-bytes")
+        xmltodict = sys.modules.get("xmltodict")
+        stub = type(sys)("xmltodict")
+        stub.parse = lambda _content: {}
+        sys.modules["xmltodict"] = stub
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.getcwd()
+            try:
+                with patch.object(FINALIZE, "RAM_DRIVE", f"{tmp}/"), patch.object(
+                    FINALIZE, "fetch", side_effect=[metadata, downloaded]
+                ), patch.object(
+                    FINALIZE, "release_version", return_value="1.0.0"
+                ), patch.object(
+                    FINALIZE, "Popen", return_value=process
+                ) as popen:
+                    if returncode == 0:
+                        FINALIZE.install_fabric("1.19.2")
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            FINALIZE.install_fabric("1.19.2")
+                    self.assertFalse((Path(tmp) / "fabric-installer.jar").exists())
+                    popen.assert_called_once()
+            finally:
+                os.chdir(previous)
+                if xmltodict is None:
+                    sys.modules.pop("xmltodict", None)
+                else:
+                    sys.modules["xmltodict"] = xmltodict
+        process.wait.assert_called_once()
+
+    def test_installer_success_returns(self):
+        self.run_install(0)
+
+    def test_installer_failure_raises(self):
+        self.run_install(3)
+
+
 class HeapTests(unittest.TestCase):
     def limit(self, files, free_kb):
         def read_text(path):
@@ -240,17 +282,21 @@ class HeapTests(unittest.TestCase):
     def test_host_sized_heap_matches_the_old_quarter(self):
         self.assertEqual(FINALIZE.heap_gigabytes(63146052), 15)
 
-    def test_quarter_under_one_gigabyte_floors_at_one(self):
-        self.assertEqual(FINALIZE.heap_gigabytes(1_000_000), 1)
+    def test_two_gib_floors_at_one_because_the_quarter_is_under_one(self):
+        self.assertEqual(FINALIZE.heap_gigabytes(2 * FINALIZE.ONE_G), 1)
         self.assertEqual(FINALIZE.heap_gigabytes(3_000_000), 1)
 
-    def test_four_gigabytes_is_one_and_eight_is_two(self):
-        self.assertEqual(FINALIZE.heap_gigabytes(4_000_000), 1)
-        self.assertEqual(FINALIZE.heap_gigabytes(8_000_000), 2)
+    def test_four_gib_is_one_and_eight_gib_is_two(self):
+        self.assertEqual(FINALIZE.heap_gigabytes(4 * FINALIZE.ONE_G), 1)
+        self.assertEqual(FINALIZE.heap_gigabytes(8 * FINALIZE.ONE_G), 2)
 
-    def test_under_one_gigabyte_refuses_to_start(self):
+    def test_under_one_gib_refuses_to_start(self):
         with self.assertRaises(RuntimeError):
-            FINALIZE.heap_gigabytes(999_999)
+            FINALIZE.heap_gigabytes(FINALIZE.ONE_G - 1)
+
+    def test_one_gib_refuses_a_heap_that_fills_the_cgroup(self):
+        with self.assertRaises(RuntimeError):
+            FINALIZE.heap_gigabytes(FINALIZE.ONE_G)
 
     def test_start_uses_the_cgroup_heap_and_does_not_call_free(self):
         def read_text(path):
@@ -273,6 +319,15 @@ class HeapTests(unittest.TestCase):
     def test_start_refuses_before_launching_java(self):
         with patch.object(FINALIZE, "chdir"), patch.object(
             FINALIZE, "memory_limit_kb", return_value=512 * 1024
+        ), patch.object(FINALIZE, "Popen") as popen:
+            with self.assertRaises(RuntimeError):
+                FINALIZE.start_minecraft(False)
+
+        popen.assert_not_called()
+
+    def test_start_refuses_a_one_gib_cgroup_before_launching_java(self):
+        with patch.object(FINALIZE, "chdir"), patch.object(
+            FINALIZE, "memory_limit_kb", return_value=FINALIZE.ONE_G
         ), patch.object(FINALIZE, "Popen") as popen:
             with self.assertRaises(RuntimeError):
                 FINALIZE.start_minecraft(False)
@@ -348,6 +403,44 @@ class EulaTests(unittest.TestCase):
             text = (Path(tmp) / "eula.txt").read_text(encoding="utf-8")
         self.assertIn("eula=true\n", text)
 
+    def test_rcon_is_enabled_and_an_existing_password_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(FINALIZE, "RAM_DRIVE", f"{tmp}/"), patch.dict(
+                os.environ, {"RCON_PASSWORD": "from-env"}
+            ):
+                properties = Path(tmp) / "server.properties"
+                properties.write_text(
+                    "enable-rcon=false\nrcon.password=kept\nmotd=hi\n",
+                    encoding="utf-8",
+                )
+                FINALIZE.enable_rcon()
+                text = properties.read_text(encoding="utf-8")
+        self.assertIn("enable-rcon=true\n", text)
+        self.assertIn("rcon.password=kept\n", text)
+        self.assertIn("rcon.port=25575\n", text)
+        self.assertIn("motd=hi\n", text)
+        self.assertNotIn("from-env", text)
+
+    def test_missing_rcon_password_uses_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(FINALIZE, "RAM_DRIVE", f"{tmp}/"), patch.dict(
+                os.environ, {"RCON_PASSWORD": "from-env"}
+            ):
+                FINALIZE.enable_rcon()
+                text = (Path(tmp) / "server.properties").read_text(encoding="utf-8")
+        self.assertIn("enable-rcon=true\n", text)
+        self.assertIn("rcon.password=from-env\n", text)
+
+    def test_unset_rcon_password_uses_the_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(FINALIZE, "RAM_DRIVE", f"{tmp}/"), patch.dict(
+                os.environ, {}, clear=False
+            ):
+                os.environ.pop("RCON_PASSWORD", None)
+                FINALIZE.enable_rcon()
+                text = (Path(tmp) / "server.properties").read_text(encoding="utf-8")
+        self.assertIn("rcon.password=minecraft\n", text)
+
     def test_unset_eula_leaves_the_ramdisk_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(FINALIZE, "RAM_DRIVE", f"{tmp}/"), patch.dict(
@@ -373,6 +466,8 @@ class StartupTests(unittest.TestCase):
         ), patch.object(
             FINALIZE, "accept_eula"
         ), patch.object(
+            FINALIZE, "enable_rcon"
+        ), patch.object(
             FINALIZE, "start_minecraft", return_value=process
         ), patch.object(
             FINALIZE, "sleep"
@@ -391,6 +486,154 @@ class StartupTests(unittest.TestCase):
         ):
             FINALIZE.main()
         return store, codes, shutdown
+
+    def test_volume_sync_runs_before_install_and_keeps_the_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ram = root / "ram"
+            nfs = root / "nfs"
+            (nfs / "world").mkdir(parents=True)
+            (nfs / "world" / "keep.txt").write_text("world", encoding="utf-8")
+            ram.mkdir()
+            order = []
+
+            def install(_version):
+                order.append("install")
+                (ram / "fabric-server-launch.jar").write_bytes(b"jar")
+                library = ram / "libraries"
+                library.mkdir()
+                (library / "x.jar").write_bytes(b"lib")
+
+            def sync(ram_to_data_store=True):
+                order.append("sync")
+                self.assertFalse(ram_to_data_store)
+                original_sync(ram_to_data_store)
+
+            original_sync = FINALIZE.sync_copy
+            process = Server(1)
+
+            def watch(*_values):
+                FINALIZE.LOGINFO.watched_value_found = False
+
+            store = root / "store.pckl"
+            with patch.object(FINALIZE, "RAM_DRIVE", f"{ram}/"), patch.object(
+                FINALIZE, "NFS_DRIVE", f"{nfs}/"
+            ), patch.object(FINALIZE, "DATA_STORE", str(store)), patch.object(
+                FINALIZE, "signal"
+            ), patch.object(
+                FINALIZE, "install_fabric", side_effect=install
+            ), patch.object(
+                FINALIZE, "sync_copy", side_effect=sync
+            ), patch.object(
+                FINALIZE, "accept_eula"
+            ), patch.object(
+                FINALIZE, "enable_rcon"
+            ), patch.object(
+                FINALIZE, "start_minecraft", return_value=process
+            ), patch.object(
+                FINALIZE, "sleep"
+            ), patch.object(
+                FINALIZE.LOGINFO, "watch_for_value", side_effect=watch
+            ), patch.object(
+                FINALIZE.LOGINFO, "close"
+            ), patch.object(
+                FINALIZE.LOGERR, "close"
+            ), patch.object(
+                FINALIZE, "exit_now"
+            ), patch.dict(
+                "os.environ", {"MINECRAFT_VERSION": "1.19.2"}
+            ):
+                FINALIZE.main()
+
+            self.assertEqual(order, ["sync", "install"])
+            self.assertEqual((ram / "fabric-server-launch.jar").read_bytes(), b"jar")
+            self.assertEqual((ram / "libraries" / "x.jar").read_bytes(), b"lib")
+            self.assertEqual(
+                (ram / "world" / "keep.txt").read_text(encoding="utf-8"), "world"
+            )
+
+    def test_main_enables_rcon_before_launch(self):
+        process = Server(1)
+        order = []
+
+        def watch(*_values):
+            FINALIZE.LOGINFO.watched_value_found = False
+
+        def enable():
+            order.append("rcon")
+
+        def start(_version_change):
+            order.append("start")
+            return process
+
+        store = Path(tempfile.mkdtemp()) / "store.pckl"
+        with patch.object(FINALIZE, "DATA_STORE", str(store)), patch.object(
+            FINALIZE, "signal"
+        ), patch.object(FINALIZE, "install_fabric"), patch.object(
+            FINALIZE, "sync_copy"
+        ), patch.object(
+            FINALIZE, "accept_eula"
+        ), patch.object(
+            FINALIZE, "enable_rcon", side_effect=enable
+        ), patch.object(
+            FINALIZE, "start_minecraft", side_effect=start
+        ), patch.object(
+            FINALIZE, "sleep"
+        ), patch.object(
+            FINALIZE.LOGINFO, "watch_for_value", side_effect=watch
+        ), patch.object(
+            FINALIZE.LOGINFO, "close"
+        ), patch.object(
+            FINALIZE.LOGERR, "close"
+        ), patch.object(
+            FINALIZE, "exit_now"
+        ), patch.dict(
+            "os.environ", {"MINECRAFT_VERSION": "1.19.2"}
+        ):
+            FINALIZE.main()
+
+        self.assertEqual(order, ["rcon", "start"])
+
+    def test_truncated_store_does_not_stop_startup(self):
+        process = Server(1)
+        installed = []
+
+        def watch(*_values):
+            FINALIZE.LOGINFO.watched_value_found = False
+
+        def install(_version):
+            installed.append(_version)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "store.pckl"
+            store.write_bytes(b"\x80\x04\x95")
+            with patch.object(FINALIZE, "DATA_STORE", str(store)), patch.object(
+                FINALIZE, "signal"
+            ), patch.object(
+                FINALIZE, "install_fabric", side_effect=install
+            ), patch.object(
+                FINALIZE, "sync_copy"
+            ), patch.object(
+                FINALIZE, "accept_eula"
+            ), patch.object(
+                FINALIZE, "enable_rcon"
+            ), patch.object(
+                FINALIZE, "start_minecraft", return_value=process
+            ), patch.object(
+                FINALIZE, "sleep"
+            ), patch.object(
+                FINALIZE.LOGINFO, "watch_for_value", side_effect=watch
+            ), patch.object(
+                FINALIZE.LOGINFO, "close"
+            ), patch.object(
+                FINALIZE.LOGERR, "close"
+            ), patch.object(
+                FINALIZE, "exit_now"
+            ), patch.dict(
+                "os.environ", {"MINECRAFT_VERSION": "1.19.2"}
+            ):
+                FINALIZE.main()
+        self.assertEqual(installed, ["1.19.2"])
 
     def test_exit_before_rcon_does_not_record_or_copy(self):
         process = Server(1)

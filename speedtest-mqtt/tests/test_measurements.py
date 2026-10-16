@@ -12,6 +12,16 @@ SCRIPTS = overlay(REPO, REPO / "speedtest-mqtt" / "root" / "scripts")
 JOB = load(SCRIPTS / "setup" / "run_job.py", "speedtest_job")
 
 
+class Response:
+    def __init__(self, content, failed=False):
+        self.content = content
+        self.failed = failed
+
+    def raise_for_status(self):
+        if self.failed:
+            raise JOB.RequestsHTTPError("status")
+
+
 class MeasurementTests(unittest.TestCase):
     def test_percentile_uses_the_index_when_the_rank_is_whole(self):
         self.assertEqual(JOB.calculate_percentile([4, 1, 3, 2], 50), 3)
@@ -28,7 +38,9 @@ class MeasurementTests(unittest.TestCase):
 
     def test_download_success_returns_the_rate_and_waits(self):
         clocks = iter([10.0, 12.0])
-        with patch.object(JOB, "requests_get", return_value=object()) as get:
+        with patch.object(
+            JOB, "requests_get", return_value=Response(b"x" * 200000)
+        ) as get:
             with patch.object(JOB, "sleep") as slept:
                 with patch.object(JOB, "time", side_effect=lambda: next(clocks)):
                     result = JOB.download(200000)
@@ -50,9 +62,30 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(result, 0)
         slept.assert_not_called()
 
+    def test_download_http_error_returns_zero(self):
+        clocks = iter([10.0, 12.0])
+        with patch.object(
+            JOB, "requests_get", return_value=Response(b"no", failed=True)
+        ):
+            with patch.object(JOB, "sleep") as slept:
+                with patch.object(JOB, "time", side_effect=lambda: next(clocks)):
+                    result = JOB.download(50_000_000)
+
+        self.assertEqual(result, 0)
+        slept.assert_not_called()
+
+    def test_download_short_body_uses_the_bytes_read(self):
+        clocks = iter([10.0, 12.0])
+        with patch.object(JOB, "requests_get", return_value=Response(b"x" * 1000)):
+            with patch.object(JOB, "sleep"):
+                with patch.object(JOB, "time", side_effect=lambda: next(clocks)):
+                    result = JOB.download(50_000_000)
+
+        self.assertEqual(result, 0.004)
+
     def test_upload_success_posts_the_buffer(self):
         clocks = iter([1.0, 3.0])
-        with patch.object(JOB, "requests_post", return_value=object()) as post:
+        with patch.object(JOB, "requests_post", return_value=Response(b"")) as post:
             with patch.object(JOB, "sleep") as slept:
                 with patch.object(JOB, "time", side_effect=lambda: next(clocks)):
                     result = JOB.upload(100000)

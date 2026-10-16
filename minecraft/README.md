@@ -12,6 +12,8 @@ Alpine 3.24 image that installs a Fabric server and runs it. Java is OpenJDK 17.
 
 `EULA=true` writes `eula.txt` on the ramdisk before launch. That file is one of the names copied back to `/mnt/minecraft`, so an acceptance on the volume is there on the next start. Without it, the server writes `eula=false` and exits.
 
+Startup turns on RCON in `server.properties` so the ready check can see `RCON running`. An existing `rcon.password` is kept. Otherwise the file gets `RCON_PASSWORD`, or `minecraft` when that variable is unset.
+
 The container starts at `/docker_service_init`. Minecraft has no setup scripts, so the init replaces itself with `/scripts/finalize`. Startup downloads the Fabric installer from `maven.fabricmc.net`. A transient DNS or connection failure is retried for about fifteen seconds. The process then exits with status 1. A signal before the server process exists exits without copying the ramdisk back over the world.
 
 SIGTERM waits up to 20 seconds for the server to stop, then copies the ramdisk for up to 150 seconds. `docker stop -t` and a pod `terminationGracePeriodSeconds` have to be at least 180. A shorter stop kills the process while that copy is still running.

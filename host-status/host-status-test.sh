@@ -166,8 +166,42 @@ assert data["temperature_c"] is None, data
 PY
 printf 'temperature null\n'
 
+cold_only=$(mktemp -d)
+trap 'rm -rf "$fake" "$base" "$fallback" "$cold" "$cold_only"' EXIT
+mkdir -p "$cold_only/proc/net" "$cold_only/sys/class/thermal/thermal_zone0"
+write_cpu "$cold_only" "100 0 0 900 0 0 0 0 0 0" "350 0 0 1650 0 0 0 0 0 0"
+printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' >"$cold_only/proc/meminfo"
+write_dev "$cold_only/proc/net/dev.1" eth0 1000 2000
+write_dev "$cold_only/proc/net/dev.2" eth0 5000 4000
+printf 'Iface Destination Gateway Flags RefCnt Use Metric Mask\neth0 00000000 0100000A 0003 0 0 100 00000000\n' >"$cold_only/proc/net/route"
+printf -- '-5000\n' >"$cold_only/sys/class/thermal/thermal_zone0/temp"
+cold_only_payload=$(run_script "$cold_only" 1)
+python3 - "$cold_only_payload" <<'PY'
+import json
+import sys
+data = json.loads(sys.argv[1])
+assert data["temperature_c"] == -5.0, data
+PY
+printf '500\n' >"$cold_only/sys/class/thermal/thermal_zone0/temp"
+cold_only_payload=$(run_script "$cold_only" 1)
+python3 - "$cold_only_payload" <<'PY'
+import json
+import sys
+data = json.loads(sys.argv[1])
+assert data["temperature_c"] == 0.5, data
+PY
+printf '1000\n' >"$cold_only/sys/class/thermal/thermal_zone0/temp"
+cold_only_payload=$(run_script "$cold_only" 1)
+python3 - "$cold_only_payload" <<'PY'
+import json
+import sys
+data = json.loads(sys.argv[1])
+assert data["temperature_c"] == 1.0, data
+PY
+printf 'temperature cold\n'
+
 quiet=$(mktemp -d)
-trap 'rm -rf "$fake" "$base" "$fallback" "$cold" "$quiet"' EXIT
+trap 'rm -rf "$fake" "$base" "$fallback" "$cold" "$cold_only" "$quiet"' EXIT
 mkdir -p "$quiet/proc"
 write_cpu "$quiet" "100 0 0 900 0 0 0 0 0 0" "100 0 0 900 0 0 0 0 0 0"
 printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' >"$quiet/proc/meminfo"
@@ -179,7 +213,7 @@ fi
 printf 'zero cpu delta\n'
 
 early=$(mktemp -d)
-trap 'rm -rf "$fake" "$base" "$fallback" "$cold" "$quiet" "$early"' EXIT
+trap 'rm -rf "$fake" "$base" "$fallback" "$cold" "$cold_only" "$quiet" "$early"' EXIT
 mkdir -p "$early/proc"
 write_cpu "$early" "100 0 0 900 0 0 0 0 0 0" "350 0 0 1650 0 0 0 0 0 0"
 printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' >"$early/proc/meminfo"

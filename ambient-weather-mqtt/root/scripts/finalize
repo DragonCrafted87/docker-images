@@ -29,6 +29,8 @@ def update_fields(environ):
     fields = {}
     for key, value in raw.items():
         field = key[key.rfind("/") + 1 :] if "/" in key else key
+        if field.lower() in {"passkey", "password"}:
+            continue
         fields[field] = convert_value(value)
 
     station_types = raw.get("stationtype", [])
