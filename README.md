@@ -16,7 +16,7 @@ A tag `minecraft-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publis
 
 ## foundry
 
-`foundry/` builds `ghcr.io/dragoncrafted87/alpine-foundry-vtt-runner` from Alpine 3.24. The entrypoint is the Node command that starts Foundry with `/home/docker/data`.
+`foundry/` builds `ghcr.io/dragoncrafted87/alpine-foundry-vtt-runner` from Node 20 on Alpine. Foundry 9 calls `util.isDate`, which Node 24 removed. The entrypoint is the Node command that starts Foundry with `/home/docker/data`.
 
 A tag `foundry-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publish `edge`.
 

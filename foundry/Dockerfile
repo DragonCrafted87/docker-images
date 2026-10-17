@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
-FROM alpine:3.24
+# Foundry 9 calls util.isDate. Node 24 removed that function.
+FROM node:20-alpine
 
 RUN <<eot ash
     set -e
 
     apk upgrade
     apk add --no-cache --update \
-        nodejs \
         tzdata
 
     rm -rf /tmp/*
@@ -20,6 +20,8 @@ ARG GID=1000
 RUN ash <<eot
     set -e
 
+    # node:20-alpine already owns uid 1000. Foundry's data is owned by that uid.
+    deluser node
     addgroup \
         --gid "$GID" \
         --system "$USER"
