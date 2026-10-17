@@ -20,6 +20,11 @@ if [ "$user" != "docker" ]; then
 fi
 
 docker run --rm --entrypoint node "$image" --version
+kind=$(docker run --rm --entrypoint node "$image" -e 'process.stdout.write(typeof require("util").isDate)')
+if [ "$kind" != "function" ]; then
+    printf 'util.isDate is %s\n' "$kind" >&2
+    exit 1
+fi
 
 set +e
 output=$(docker run --rm "$image" 2>&1)

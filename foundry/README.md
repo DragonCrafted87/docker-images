@@ -1,6 +1,6 @@
 # foundry
 
-Alpine 3.24 image with Node. The entrypoint is `node server/resources/app/main.js --headless --dataPath=/home/docker/data`.
+Node 20 on Alpine. Foundry 9 calls `util.isDate`, which Node 24 removed. The entrypoint is `node server/resources/app/main.js --headless --dataPath=/home/docker/data`.
 
 ```sh
 ./build.sh
