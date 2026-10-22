@@ -303,7 +303,9 @@ fi
 wait_mysql() {
     name=$1
     for _ in $(seq 1 60); do
-        if docker exec "$name" mysqladmin ping -uroot -pprove-secret --silent >/dev/null 2>&1; then
+        # ping succeeds on the temporary server, before the root password exists.
+        if docker logs "$name" 2>&1 | grep -q 'MySQL init process done. Ready for start up.' \
+            && docker exec "$name" mysql -uroot -pprove-secret -e 'SELECT 1' >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -382,11 +384,17 @@ docker run -d --name "$pg" --network "$net" \
     --env POSTGRES_DB=pulp \
     postgres:16.15 >/dev/null
 for _ in $(seq 1 60); do
-    if docker exec "$pg" pg_isready -U pulp -d pulp >/dev/null 2>&1; then
+    if docker logs "$pg" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up.' \
+        && docker exec "$pg" psql -U pulp -d pulp -c 'SELECT 1' >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
+if ! docker exec "$pg" psql -U pulp -d pulp -c 'SELECT 1' >/dev/null 2>&1; then
+    printf '%s did not become ready\n' "$pg" >&2
+    docker logs "$pg" >&2 || true
+    exit 1
+fi
 docker exec "$pg" psql -U pulp -d pulp -c "CREATE TABLE t(name TEXT); INSERT INTO t VALUES ('prove-row');"
 mkdir -p "$work/pg"
 run_backup \
