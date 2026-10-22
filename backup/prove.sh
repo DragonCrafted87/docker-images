@@ -510,30 +510,37 @@ path = os.environ["RCON_LOG"]
 server = socket.socket()
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(("0.0.0.0", 35575))
-server.listen(1)
+server.listen(8)
 seen = []
 
 def read_packet(conn):
-    header = b""
-    while len(header) < 4:
-        chunk = conn.recv(4 - len(header))
-        if not chunk:
-            return None
-        header += chunk
-    size = struct.unpack("<i", header)[0]
-    body = b""
-    while len(body) < size:
-        chunk = conn.recv(size - len(body))
-        if not chunk:
-            return None
-        body += chunk
-    req_id, kind = struct.unpack("<ii", body[:8])
-    payload = body[8:-2].decode()
-    return req_id, kind, payload
+    try:
+        header = b""
+        while len(header) < 4:
+            chunk = conn.recv(4 - len(header))
+            if not chunk:
+                return None
+            header += chunk
+        size = struct.unpack("<i", header)[0]
+        body = b""
+        while len(body) < size:
+            chunk = conn.recv(size - len(body))
+            if not chunk:
+                return None
+            body += chunk
+        req_id, kind = struct.unpack("<ii", body[:8])
+        payload = body[8:-2].decode()
+        return req_id, kind, payload
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        # The client resets the socket after it reads the reply.
+        return None
 
 def write_packet(conn, req_id, kind, payload):
-    data = struct.pack("<ii", req_id, kind) + payload.encode() + b"\x00\x00"
-    conn.sendall(struct.pack("<i", len(data)) + data)
+    try:
+        data = struct.pack("<ii", req_id, kind) + payload.encode() + b"\x00\x00"
+        conn.sendall(struct.pack("<i", len(data)) + data)
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        return
 
 while "save-on" not in seen:
     conn, _ = server.accept()
