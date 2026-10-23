@@ -1,20 +1,498 @@
 #!/bin/sh
+# Write one checksummed tar.xz, then prune that set.
+# Pruning defaults to a dry-run and runs only after this archive is published.
 set -eu
 
-base_backup_name="${BACKUP_NAME:-minecraft-vanillaplusplus-backup}"
-# %G and %V are an ISO year and week. They have to stay a pair at a year boundary.
-date_stamp="$(date +%G-W%V-%u-%H-%M-%S)"
-backup_name="${base_backup_name}-${date_stamp}.tar.xz"
-source_path=/mnt/source
+export HOME=/tmp
+
 dest_dir=/mnt/backups
-partial="${dest_dir}/.${backup_name}.partial"
+source_path=/mnt/source
+mode=${BACKUP_MODE:-run}
+method=${BACKUP_METHOD:-tar}
+prune_mode=${BACKUP_PRUNE:-dry-run}
+keep_daily=${BACKUP_KEEP_DAILY:-14}
+keep_weekly=${BACKUP_KEEP_WEEKLY:-8}
+keep_monthly=${BACKUP_KEEP_MONTHLY:-12}
+
+partial=
+sum_file=
+stage=
+secret_file=
+backup_name=
+published=0
+rcon_held=0
+rcon_failed=0
+write_log=0
+rcon_password=
+source_kib=0
+payload_bytes=0
+end_hash=
+end_bytes=0
+
+fail() {
+    printf 'backup failed: %s\n' "$1" >&2
+    if [ "$write_log" -eq 1 ]; then
+        printf 'backup failed: %s\n' "$1" >> "$dest_dir/backup.log" || true
+    fi
+    exit 1
+}
+
+log() {
+    printf '%s\n' "$1"
+    if [ "$write_log" -eq 1 ]; then
+        printf '%s\n' "$1" >> "$dest_dir/backup.log"
+    fi
+}
+
+rcon_cmd() {
+    rcon -m -H "$RCON_HOST" -p "${RCON_PORT:-25575}" -P "$rcon_password" "$1"
+}
+
+cleanup() {
+    status=$?
+    if [ "$rcon_held" -eq 1 ]; then
+        rcon_held=0
+        rcon_cmd "save-on" || rcon_failed=1
+    fi
+    if [ "$published" -eq 0 ]; then
+        if [ -n "$partial" ]; then
+            rm -f "$partial"
+        fi
+        if [ -n "$backup_name" ] && [ ! -e "$dest_dir/$backup_name" ]; then
+            rm -f "$sum_file"
+        fi
+    fi
+    if [ -n "$stage" ]; then
+        rm -rf "$stage"
+    fi
+    if [ -n "$secret_file" ]; then
+        rm -f "$secret_file"
+    fi
+    if [ "$status" -eq 0 ] && [ "$rcon_failed" -eq 1 ]; then
+        status=1
+    fi
+    trap - EXIT
+    exit "$status"
+}
+trap cleanup EXIT
+
+require_number() {
+    case $1 in
+        '' | *[!0-9]*)
+            fail "$2 is not a whole number"
+            ;;
+    esac
+}
+
+current_arg() {
+    if [ -n "${BACKUP_NOW:-}" ]; then
+        printf '%s\n' "$BACKUP_NOW" | tr 'T' ' '
+    fi
+}
+
+current_day() {
+    if [ -n "${BACKUP_NOW:-}" ]; then
+        date -d "$(current_arg)" +%Y-%m-%d
+    else
+        date +%Y-%m-%d
+    fi
+}
+
+current_stamp() {
+    if [ -n "${BACKUP_NOW:-}" ]; then
+        date -d "$(current_arg)" +%G-W%V-%u-%H-%M-%S
+    else
+        date +%G-W%V-%u-%H-%M-%S
+    fi
+}
+
+archive_names() {
+    find "$dest_dir" -maxdepth 1 -type f -name '*.tar.xz' | sed 's|.*/||'
+}
+
+set_prefix() {
+    name=$1
+    suffix='-[0-9][0-9][0-9][0-9]-W[0-9][0-9]-[1-7]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9].tar.xz'
+    # suffix is a glob, so it stays unquoted.
+    case $name in
+        *$suffix)
+            printf '%s\n' "${name%$suffix}"
+            ;;
+    esac
+}
+
+delete_one() {
+    name=$1
+    sum="$dest_dir/$name.sha256"
+    if [ "$prune_mode" = "apply" ]; then
+        rm -f "$dest_dir/$name"
+        log "prune deleted $name"
+        if [ -f "$sum" ]; then
+            rm -f "$sum"
+            log "prune deleted ${name}.sha256"
+        fi
+    else
+        log "prune would delete $name"
+        if [ -f "$sum" ]; then
+            log "prune would delete ${name}.sha256"
+        fi
+    fi
+}
+
+prune_set() {
+    prefix=$1
+    names=$(mktemp)
+    decisions=$(mktemp)
+    archive_names | while IFS= read -r name; do
+        got=$(set_prefix "$name" || true)
+        if [ "$got" = "$prefix" ]; then
+            printf '%s\n' "$name"
+        fi
+    done | sort -r > "$names"
+    if ! awk -f /usr/local/lib/backup/prune.awk \
+        -v anchor="$anchor_day" \
+        -v daily="$keep_daily" \
+        -v weekly="$keep_weekly" \
+        -v monthly="$keep_monthly" \
+        "$names" > "$decisions"; then
+        rm -f "$names" "$decisions"
+        fail "prune selection failed"
+    fi
+    kept=0
+    dropped=0
+    while read -r action name; do
+        case $action in
+            keep)
+                kept=$((kept + 1))
+                ;;
+            drop)
+                dropped=$((dropped + 1))
+                delete_one "$name"
+                ;;
+            '')
+                ;;
+            *)
+                rm -f "$names" "$decisions"
+                fail "unexpected prune line"
+                ;;
+        esac
+    done < "$decisions"
+    rm -f "$names" "$decisions"
+    log "prune ${prune_mode} set=${prefix} keep=${kept} drop=${dropped}"
+}
+
+run_report() {
+    anchor_day=$(current_day)
+    log "prune report anchor=${anchor_day} daily=${keep_daily} weekly=${keep_weekly} monthly=${keep_monthly}"
+    prune_mode=dry-run
+    prefixes=$(mktemp)
+    archive_names | while IFS= read -r name; do
+        set_prefix "$name" || true
+    done | sort -u > "$prefixes"
+    while IFS= read -r prefix; do
+        if [ -n "$prefix" ]; then
+            prune_set "$prefix"
+        fi
+    done < "$prefixes"
+    rm -f "$prefixes"
+}
+
+hold_saves() {
+    if [ -n "${RCON_PASSWORD:-}" ]; then
+        rcon_password=$RCON_PASSWORD
+    else
+        props=$source_path/server.properties
+        if [ ! -f "$props" ]; then
+            fail "RCON_HOST is set and server.properties is missing"
+        fi
+        rcon_password=$(
+            awk -F= '$1 == "rcon.password" {
+                print substr($0, index($0, "=") + 1)
+                exit
+            }' "$props"
+        )
+    fi
+    if [ -z "$rcon_password" ]; then
+        fail "rcon password is empty"
+    fi
+    log "rcon save-off ${RCON_HOST}"
+    rcon_cmd "save-off"
+    rcon_held=1
+    log "rcon save-all flush ${RCON_HOST}"
+    rcon_cmd "save-all flush"
+}
+
+release_saves() {
+    if [ "$rcon_held" -eq 1 ]; then
+        rcon_held=0
+        log "rcon save-on ${RCON_HOST}"
+        rcon_cmd "save-on" || rcon_failed=1
+    fi
+}
+
+make_stage() {
+    stage=$(mktemp -d)
+}
+
+copy_extras() {
+    if [ -n "${BACKUP_COPY:-}" ]; then
+        if [ ! -e "$source_path/$BACKUP_COPY" ]; then
+            fail "BACKUP_COPY not found: ${BACKUP_COPY}"
+        fi
+        mkdir -p "$stage/$(dirname "$BACKUP_COPY")"
+        cp -a "$source_path/$BACKUP_COPY" "$stage/$BACKUP_COPY"
+    fi
+    if [ -n "${BACKUP_EXTRA:-}" ]; then
+        if [ ! -d "$BACKUP_EXTRA" ]; then
+            fail "BACKUP_EXTRA is not a directory"
+        fi
+        cp -a "$BACKUP_EXTRA/." "$stage/"
+    fi
+}
+
+tar_stage() {
+    if [ ! -d "$stage" ]; then
+        fail "payload stage is missing"
+    fi
+    found=0
+    for entry in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+        if [ -e "$entry" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ "$found" -ne 1 ]; then
+        fail "payload is empty"
+    fi
+    tar -C "$stage" -chJf "$partial" .
+}
+
+snapshot_sqlite() {
+    if [ -z "${SQLITE_DB:-}" ]; then
+        fail "SQLITE_DB is required"
+    fi
+    make_stage
+    copy_extras
+    # SQLITE_DB is a whitespace-separated list of paths relative to /mnt/source.
+    for rel in $SQLITE_DB; do
+        src="$source_path/$rel"
+        if [ ! -s "$src" ]; then
+            fail "sqlite database missing: ${rel}"
+        fi
+        dest="$stage/$rel"
+        mkdir -p "$(dirname "$dest")"
+        sqlite3 -readonly "$src" ".timeout 10000" ".backup ${dest}" \
+            || fail "sqlite backup failed for ${rel}"
+        check=$(sqlite3 "$dest" "PRAGMA integrity_check;")
+        if [ "$check" != "ok" ]; then
+            fail "integrity_check failed for ${rel}"
+        fi
+        size=$(wc -c < "$dest" | tr -d ' ')
+        payload_bytes=$((payload_bytes + size))
+    done
+    tar_stage
+}
+
+restore_litestream() {
+    db=${LITESTREAM_DB:-}
+    replica=${LITESTREAM_REPLICA:-/mnt/replica}
+    if [ -z "$db" ]; then
+        fail "LITESTREAM_DB is required"
+    fi
+    if [ ! -d "$replica" ]; then
+        fail "litestream replica missing"
+    fi
+    make_stage
+    copy_extras
+    secret_file=/tmp/litestream.yml
+    cat > "$secret_file" << EOF
+dbs:
+  - path: ${db}
+    replica:
+      type: file
+      path: ${replica}
+EOF
+    out="$stage/$(basename "$db")"
+    litestream restore -config "$secret_file" -o "$out" "$db"
+    rm -f "$secret_file"
+    secret_file=
+    if [ ! -s "$out" ]; then
+        fail "litestream restore wrote an empty database"
+    fi
+    check=$(sqlite3 "$out" "PRAGMA integrity_check;")
+    if [ "$check" != "ok" ]; then
+        fail "integrity_check failed for litestream restore"
+    fi
+    payload_bytes=$(wc -c < "$out" | tr -d ' ')
+    tar_stage
+}
+
+dump_mysql() {
+    if [ -z "${MYSQL_HOST:-}" ] || [ -z "${MYSQL_USER:-}" ] || [ -z "${MYSQL_DATABASE:-}" ]; then
+        fail "MYSQL_HOST, MYSQL_USER, and MYSQL_DATABASE are required"
+    fi
+    make_stage
+    out="$stage/${MYSQL_DATABASE}.sql"
+    mysqldump \
+        --protocol=TCP \
+        --host="$MYSQL_HOST" \
+        --port="${MYSQL_PORT:-3306}" \
+        --user="$MYSQL_USER" \
+        --single-transaction \
+        --skip-ssl \
+        --skip-lock-tables \
+        --hex-blob \
+        --routines \
+        --events \
+        --triggers \
+        --default-character-set=utf8mb4 \
+        --no-tablespaces \
+        "$MYSQL_DATABASE" > "$out"
+    if ! grep -q "Dump completed" "$out"; then
+        fail "mysqldump did not finish"
+    fi
+    payload_bytes=$(wc -c < "$out" | tr -d ' ')
+    tar_stage
+}
+
+dump_postgres() {
+    if [ -z "${PGHOST:-}" ] || [ -z "${PGUSER:-}" ] || [ -z "${PGDATABASE:-}" ]; then
+        fail "PGHOST, PGUSER, and PGDATABASE are required"
+    fi
+    make_stage
+    out="$stage/${PGDATABASE}.dump"
+    pg_dump \
+        --host="$PGHOST" \
+        --port="${PGPORT:-5432}" \
+        --username="$PGUSER" \
+        --dbname="$PGDATABASE" \
+        --format=custom \
+        --no-password \
+        --file="$out"
+    pg_restore --list "$out" > /dev/null
+    payload_bytes=$(wc -c < "$out" | tr -d ' ')
+    tar_stage
+}
+
+archive_tree() {
+    if [ ! -d "$source_path" ]; then
+        fail "source directory missing"
+    fi
+    found=0
+    for entry in "$source_path"/* "$source_path"/.[!.]* "$source_path"/..?*; do
+        if [ -e "$entry" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ "$found" -ne 1 ]; then
+        fail "source directory is empty"
+    fi
+    source_kib=$(du -sk "$source_path" | awk '{ print $1 }')
+    tar -C "$source_path" -chJf "$partial" .
+}
+
+publish() {
+    xz -t "$partial"
+    end_hash=$(sha256sum "$partial" | awk 'NR == 1 { print $1 }')
+    case $end_hash in
+        *[!0-9a-f]* | '')
+            fail "checksum failed"
+            ;;
+    esac
+    if [ -e "$dest_dir/$backup_name" ]; then
+        fail "archive already exists: ${backup_name}"
+    fi
+    printf '%s  %s\n' "$end_hash" "$backup_name" > "$sum_file"
+    mv "$partial" "$dest_dir/$backup_name"
+    published=1
+    end_bytes=$(wc -c < "$dest_dir/$backup_name" | tr -d ' ')
+}
+
+require_number "$keep_daily" BACKUP_KEEP_DAILY
+require_number "$keep_weekly" BACKUP_KEEP_WEEKLY
+require_number "$keep_monthly" BACKUP_KEEP_MONTHLY
+
+case $mode in
+    run | report)
+        ;;
+    *)
+        fail "BACKUP_MODE must be run or report"
+        ;;
+esac
+
+case $prune_mode in
+    dry-run | apply | off)
+        ;;
+    *)
+        fail "BACKUP_PRUNE must be dry-run, apply, or off"
+        ;;
+esac
+
+case $method in
+    tar | sqlite | litestream | mysql | postgres)
+        ;;
+    *)
+        fail "BACKUP_METHOD is not supported: ${method}"
+        ;;
+esac
+
+if [ "$mode" = "report" ]; then
+    if [ ! -d "$dest_dir" ]; then
+        fail "backup directory missing"
+    fi
+    run_report
+    exit 0
+fi
+
+base=${BACKUP_NAME:-}
+if [ -z "$base" ]; then
+    fail "BACKUP_NAME is required"
+fi
 
 mkdir -p "$dest_dir"
+write_log=1
+anchor_day=$(current_day)
+date_stamp=$(current_stamp)
+backup_name="${base}-${date_stamp}.tar.xz"
+partial="$dest_dir/${backup_name}.partial"
+sum_file="$dest_dir/${backup_name}.sha256"
 rm -f "$partial"
 
-# -h stores the symlink target. prove.sh compares the archive to that tree.
-if ! tar -C "$source_path" -chJf "$partial" .; then
-    rm -f "$partial"
-    exit 1
+start_s=$(date +%s)
+log "backup start set=${base} method=${method} time=${date_stamp}"
+
+if [ -n "${RCON_HOST:-}" ]; then
+    hold_saves
 fi
-mv "$partial" "${dest_dir}/${backup_name}"
+
+case $method in
+    tar)
+        archive_tree
+        ;;
+    sqlite)
+        snapshot_sqlite
+        ;;
+    litestream)
+        restore_litestream
+        ;;
+    mysql)
+        dump_mysql
+        ;;
+    postgres)
+        dump_postgres
+        ;;
+esac
+
+publish
+end_s=$(date +%s)
+log "backup end set=${base} archive=${backup_name} bytes=${end_bytes} seconds=$((end_s - start_s)) sha256=${end_hash} source_kib=${source_kib} payload_bytes=${payload_bytes}"
+
+release_saves
+if [ "$rcon_failed" -eq 1 ]; then
+    fail "rcon save-on failed"
+fi
+
+if [ "$prune_mode" != "off" ]; then
+    prune_set "$base"
+fi

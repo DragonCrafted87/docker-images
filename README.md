@@ -22,9 +22,9 @@ A tag `foundry-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publish 
 
 ## backup
 
-`backup/` builds `ghcr.io/dragoncrafted87/alpine-backup-cron` from Alpine 3.24. The entrypoint copies `/mnt/source` and writes one `tar.xz` under `/mnt/backups`, named from `BACKUP_NAME` and a timestamp.
+`backup/` builds `ghcr.io/dragoncrafted87/alpine-backup-cron` from Alpine 3.24. The entrypoint writes one checksummed `tar.xz` under `/mnt/backups`. `BACKUP_METHOD` is `tar`, `sqlite`, `litestream`, `mysql`, or `postgres`. Pruning defaults to a dry-run.
 
-A tag `backup-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publish `edge`.
+A tag `backup-v2.2.0` publishes the image as `2.2.0`. Pushes to `main` publish `edge`.
 
 ## ambient-weather-mqtt
 
