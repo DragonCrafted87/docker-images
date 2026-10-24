@@ -38,6 +38,12 @@ A tag `ambient-weather-mqtt-v2.1.0` publishes the image as `2.1.0`. Pushes to `m
 
 A tag `speedtest-mqtt-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` publish `edge`.
 
+## hermes
+
+`hermes/` builds `ghcr.io/dragoncrafted87/hermes-agent:v0.22.2-screen` from `nousresearch/hermes-agent:v0.22.2`. It adds TigerVNC, the Xfce screen packages, and Proton Pass CLI 2.5.1. The base is Debian.
+
+A tag `hermes-v0.22.2-screen` publishes the image as `0.22.2-screen`. Pushes to `main` publish `edge`.
+
 ## host-status
 
 `host-status/` builds `ghcr.io/dragoncrafted87/alpine-host-status` from Alpine 3.24. It publishes CPU, memory, temperature, and default-route rates to MQTT.

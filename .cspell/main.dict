@@ -33,6 +33,7 @@ colls
 dateutc
 dateutil
 dbname
+dejavu
 deluser
 dirsync
 doy
@@ -70,6 +71,7 @@ mysqldump
 nodejs
 nodelocal
 nogui
+nousresearch
 paho
 pckl
 pgdatabase
@@ -91,7 +93,9 @@ sprintf
 stationtype
 tablespaces
 tempf
+tigervnc
 tini
+trixie
 tunl
 tzdata
 tzset
@@ -101,10 +105,14 @@ usr
 vanillaplusplus
 veth
 virbr
+vncserver
 vtt
 vxlan
 wday
 wsgiref
+xfdesktop
+xkb
 xmltodict
+xtigervnc
 yamllint
 yoe

@@ -26,8 +26,12 @@ variable "PUSH_HOST_STATUS" {
   default = "false"
 }
 
+variable "PUSH_HERMES" {
+  default = "false"
+}
+
 group "default" {
-  targets = ["base", "minecraft", "foundry", "backup", "ambient-weather-mqtt", "speedtest-mqtt", "host-status"]
+  targets = ["base", "minecraft", "foundry", "backup", "ambient-weather-mqtt", "speedtest-mqtt", "host-status", "hermes"]
 }
 
 target "base-meta" {}
@@ -43,6 +47,8 @@ target "ambient-weather-mqtt-meta" {}
 target "speedtest-mqtt-meta" {}
 
 target "host-status-meta" {}
+
+target "hermes-meta" {}
 
 target "base" {
   inherits = ["base-meta"]
@@ -109,4 +115,11 @@ target "host-status" {
   context = "host-status"
   platforms = ["linux/amd64", "linux/arm64"]
   output = PUSH_HOST_STATUS == "true" ? ["type=registry"] : ["type=cacheonly"]
+}
+
+target "hermes" {
+  inherits = ["hermes-meta"]
+  context = "hermes"
+  platforms = ["linux/amd64"]
+  output = PUSH_HERMES == "true" ? ["type=registry"] : ["type=cacheonly"]
 }
