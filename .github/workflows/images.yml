@@ -13,6 +13,7 @@ on:
     - minecraft-v*
     - speedtest-mqtt-v*
     - host-status-v*
+    - hermes-v*
 
 jobs:
   test:
@@ -42,6 +43,8 @@ jobs:
       run: bash backup/prove.sh
     - name: Host status prove
       run: bash host-status/prove.sh
+    - name: Hermes prove
+      run: bash hermes/prove.sh
 
   build:
     needs: test
@@ -63,6 +66,7 @@ jobs:
         echo "weather=ghcr.io/${owner}/alpine-ambient-weather-mqtt-publisher" >> "$GITHUB_OUTPUT"
         echo "speedtest=ghcr.io/${owner}/alpine-speedtest-mqtt-publisher" >> "$GITHUB_OUTPUT"
         echo "host_status=ghcr.io/${owner}/alpine-host-status" >> "$GITHUB_OUTPUT"
+        echo "hermes=ghcr.io/${owner}/hermes-agent" >> "$GITHUB_OUTPUT"
     - name: Publish which images
       id: push
       run: |
@@ -73,6 +77,7 @@ jobs:
         weather=false
         speedtest=false
         host_status=false
+        hermes=false
         ref="$GITHUB_REF"
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$ref" = "refs/heads/main" ]; then
         base=true
@@ -82,6 +87,7 @@ jobs:
         weather=true
         speedtest=true
         host_status=true
+        hermes=true
         fi
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/base-v}" != "$ref" ]; then
         base=true
@@ -104,6 +110,9 @@ jobs:
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/host-status-v}" != "$ref" ]; then
         host_status=true
         fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/hermes-v}" != "$ref" ]; then
+        hermes=true
+        fi
         echo "base=$base" >> "$GITHUB_OUTPUT"
         echo "minecraft=$minecraft" >> "$GITHUB_OUTPUT"
         echo "foundry=$foundry" >> "$GITHUB_OUTPUT"
@@ -111,6 +120,7 @@ jobs:
         echo "weather=$weather" >> "$GITHUB_OUTPUT"
         echo "speedtest=$speedtest" >> "$GITHUB_OUTPUT"
         echo "host_status=$host_status" >> "$GITHUB_OUTPUT"
+        echo "hermes=$hermes" >> "$GITHUB_OUTPUT"
     - name: Base meta
       id: base-meta
       uses: docker/metadata-action@v5
@@ -196,6 +206,18 @@ jobs:
           type=edge,branch=main
           type=match,pattern=host-status-v(.*),group=1
           type=sha
+    - name: Hermes meta
+      id: hermes-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.hermes }}
+        bake-target: hermes-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=hermes-v(.*),group=1
+          type=sha
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
@@ -217,9 +239,10 @@ jobs:
         PUSH_MINECRAFT: ${{ steps.push.outputs.minecraft }}
         PUSH_SPEEDTEST: ${{ steps.push.outputs.speedtest }}
         PUSH_HOST_STATUS: ${{ steps.push.outputs.host_status }}
+        PUSH_HERMES: ${{ steps.push.outputs.hermes }}
       with:
         source: .
-        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt,host-status
+        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt,host-status,hermes
         files: |
           ./docker-bake.hcl
           cwd://${{ steps.base-meta.outputs.bake-file }}
@@ -229,3 +252,4 @@ jobs:
           cwd://${{ steps.weather-meta.outputs.bake-file }}
           cwd://${{ steps.speedtest-meta.outputs.bake-file }}
           cwd://${{ steps.host-status-meta.outputs.bake-file }}
+          cwd://${{ steps.hermes-meta.outputs.bake-file }}
