@@ -30,8 +30,12 @@ variable "PUSH_HERMES" {
   default = "false"
 }
 
+variable "PUSH_ETSY" {
+  default = "false"
+}
+
 group "default" {
-  targets = ["base", "minecraft", "foundry", "backup", "ambient-weather-mqtt", "speedtest-mqtt", "host-status", "hermes"]
+  targets = ["base", "minecraft", "foundry", "backup", "ambient-weather-mqtt", "speedtest-mqtt", "host-status", "hermes", "etsy-oauth-broker"]
 }
 
 target "base-meta" {}
@@ -49,6 +53,8 @@ target "speedtest-mqtt-meta" {}
 target "host-status-meta" {}
 
 target "hermes-meta" {}
+
+target "etsy-oauth-broker-meta" {}
 
 target "base" {
   inherits = ["base-meta"]
@@ -122,4 +128,11 @@ target "hermes" {
   context = "hermes"
   platforms = ["linux/amd64"]
   output = PUSH_HERMES == "true" ? ["type=registry"] : ["type=cacheonly"]
+}
+
+target "etsy-oauth-broker" {
+  inherits = ["etsy-oauth-broker-meta"]
+  context = "etsy-oauth-broker"
+  platforms = ["linux/amd64", "linux/arm64"]
+  output = PUSH_ETSY == "true" ? ["type=registry"] : ["type=cacheonly"]
 }
