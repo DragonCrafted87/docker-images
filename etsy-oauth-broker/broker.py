@@ -1,7 +1,7 @@
 """One-shot Etsy authorization-code broker.
 
 State stays in memory. A successful exchange writes the raw refresh
-token into the handoff directory and drops the access token. Nothing
+token into one namespace Secret and drops the access token. Nothing
 in this process returns a token.
 """
 
@@ -12,7 +12,7 @@ import logging
 import os
 import secrets
 import signal
-import stat
+import ssl
 import threading
 import time
 import urllib.error
@@ -21,7 +21,6 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
-from pathlib import Path
 
 REDIRECT_URI = "https://etsy.stealthdragonland.net/oauth/callback"
 SCOPES = "listings_r listings_w shops_r shops_w"
@@ -31,13 +30,16 @@ TOKEN_ENDPOINT = "https://api.etsy.com/v3/public/oauth/token"
 STATE_TTL_SECONDS = 600
 HANDOFF_TTL_SECONDS = 24 * 60 * 60
 MAX_PENDING = 3
-MAX_HANDOFFS = 1
 MAX_QUERY_BYTES = 4096
 MAX_TOKEN_BODY = 65536
 MAX_REFRESH_BYTES = 2048
 EXCHANGE_TIMEOUT_SECONDS = 10
 CALLBACK_LIMIT = 30
 CALLBACK_WINDOW_SECONDS = 60
+REFRESH_SECRET_NAME = "etsy-refresh-token"
+REFRESH_DATA_KEY = "refresh-token"
+EXPORTED_AT = "etsy.stealthdragonland.net/exported-at"
+MAX_SECRET_BODY = 65536
 
 _LOG = logging.getLogger("etsy.oauth")
 _UNRESERVED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
@@ -56,6 +58,10 @@ class ExchangeFailed(Exception):
 
 
 class HandoffBlocked(Exception):
+    pass
+
+
+class StoreError(Exception):
     pass
 
 
@@ -180,12 +186,177 @@ def _post_token(form):
         raise ExchangeFailed from None
 
 
+class _NoKubeRedirect(urllib.request.HTTPRedirectHandler):
+
+    def redirect_request(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self, req, fp, code, msg, headers, newurl
+    ):
+        del req, fp, code, msg, headers, newurl
+        raise StoreError
+
+
+def secret_document(name, namespace, payload, exported_at):
+    encoded = base64.b64encode(payload).decode("ascii")
+    return {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "annotations": {EXPORTED_AT: str(int(exported_at))},
+        },
+        "type": "Opaque",
+        "data": {REFRESH_DATA_KEY: encoded},
+    }
+
+
+def _secret_data(document):
+    if not isinstance(document, dict):
+        return None
+    if document.get("kind") != "Secret" or document.get("type") != "Opaque":
+        return None
+    metadata = document.get("metadata")
+    data = document.get("data")
+    if not isinstance(metadata, dict) or not isinstance(data, dict):
+        return None
+    if set(data) != {REFRESH_DATA_KEY}:
+        return None
+    raw = data[REFRESH_DATA_KEY]
+    if not isinstance(raw, str):
+        return None
+    return raw
+
+
+def describe_secret(document, now):
+    raw = _secret_data(document)
+    if raw is None:
+        return "unexpected", None
+    name = document["metadata"].get("name")
+    if not isinstance(name, str) or not name:
+        return "unexpected", None
+    try:
+        size = len(base64.b64decode(raw, validate=True))
+    except ValueError:
+        return "unexpected", None
+    annotations = document["metadata"].get("annotations")
+    if not isinstance(annotations, dict):
+        annotations = {}
+    stamp = annotations.get(EXPORTED_AT)
+    if not isinstance(stamp, str) or not stamp.isdecimal():
+        return "outstanding", (name, size, None)
+    exported = int(stamp)
+    reason = "outstanding"
+    if now - exported >= HANDOFF_TTL_SECONDS:
+        reason = "expired"
+    return reason, (name, size, exported)
+
+
+class SecretStore:
+
+    def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        namespace,
+        name,
+        api,
+        token_path,
+        ca_path,
+        now,
+        opener=None,
+    ):
+        self._namespace = namespace
+        self._name = name
+        self._api = api.rstrip("/")
+        self._token_path = token_path
+        self._ca_path = ca_path
+        self._now = now
+        self._opener = opener
+
+    def bind(self, now):
+        self._now = now
+
+    def snapshot(self):
+        reason, row = self._read()
+        if row is None:
+            return reason, []
+        return reason, [row]
+
+    def publish(self, payload):
+        reason, _row = self._read()
+        if reason is not None:
+            raise HandoffBlocked
+        body = json.dumps(
+            secret_document(self._name, self._namespace, payload, self._now())
+        ).encode("utf-8")
+        try:
+            status, _ignored = self._call("POST", self._collection(), body)
+        except StoreError:
+            raise HandoffBlocked from None
+        if status not in (200, 201):
+            raise HandoffBlocked
+
+    def _collection(self):
+        return self._api + "/api/v1/namespaces/" + self._namespace + "/secrets"
+
+    def _item(self):
+        return self._collection() + "/" + self._name
+
+    def _read(self):
+        try:
+            status, payload = self._call("GET", self._item(), None)
+        except StoreError:
+            return "unavailable", None
+        if status == 404:
+            return None, None
+        if status != 200:
+            return "unavailable", None
+        try:
+            document = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return "unavailable", None
+        return describe_secret(document, self._now())
+
+    def _call(self, method, url, body):
+        if self._opener is not None:
+            status, payload = self._opener(method, url, body)
+        else:
+            status, payload = self._http(method, url, body)
+        if method == "GET" and status == 200:
+            return 200, payload[:MAX_SECRET_BODY]
+        return status, b""
+
+    def _http(self, method, url, body):
+        try:
+            with open(self._token_path, encoding="utf-8") as handle:
+                token = handle.read()
+        except OSError:
+            raise StoreError from None
+        if token.endswith("\n"):
+            token = token[:-1]
+        if not token or any(character.isspace() for character in token):
+            raise StoreError
+        request = urllib.request.Request(url, data=body, method=method)
+        request.add_header("Accept", "application/json")
+        request.add_header("Authorization", "Bearer " + token)
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+        context = ssl.create_default_context(cafile=self._ca_path)
+        handler = urllib.request.HTTPSHandler(context=context)
+        opener = urllib.request.build_opener(handler, _NoKubeRedirect)
+        try:
+            with opener.open(request, timeout=EXCHANGE_TIMEOUT_SECONDS) as response:
+                return response.status, response.read(MAX_SECRET_BODY + 1)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(MAX_SECRET_BODY + 1)
+        except (OSError, TimeoutError, urllib.error.URLError, StoreError):
+            raise StoreError from None
+
+
 class Broker:  # pylint: disable=too-many-instance-attributes
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
         keystring,
-        handoff_dir,
+        store,
         *,
         exchange=None,
         now=None,
@@ -199,9 +370,10 @@ class Broker:  # pylint: disable=too-many-instance-attributes
         if any(character.isspace() for character in keystring):
             raise ValueError
         self._keystring = keystring
-        self._handoff = Path(handoff_dir)
+        self._store = store
         self._exchange = exchange
         self._now = time.time if now is None else now
+        self._store.bind(self._now)
         self._monotonic = time.monotonic if monotonic is None else monotonic
         self._ttl = ttl
         self._max_pending = max_pending
@@ -249,7 +421,7 @@ class Broker:  # pylint: disable=too-many-instance-attributes
         if flow.scopes != SCOPES or flow.redirect_uri != REDIRECT_URI:
             self._mark("failed")
             return 500, b"error"
-        if self.directory_problem() is not None or self._handoff_reason() is not None:
+        if self._block_reason() is not None:
             self._mark("failed")
             return 500, b"error"
         refresh = b""
@@ -257,7 +429,14 @@ class Broker:  # pylint: disable=too-many-instance-attributes
             status, content_type, body = self._exchange_code(flow, code)
             refresh = accepted_refresh(status, content_type, body)
             self._publish(refresh)
-        except (ExchangeFailed, HandoffBlocked, OSError, TimeoutError, ValueError):
+        except (
+            ExchangeFailed,
+            HandoffBlocked,
+            StoreError,
+            OSError,
+            TimeoutError,
+            ValueError,
+        ):
             self._mark("failed")
             return 500, b"error"
         finally:
@@ -269,19 +448,15 @@ class Broker:  # pylint: disable=too-many-instance-attributes
     def status(self):
         with self._lock:
             self._sweep()
-            reason = self._block_reason()
-            handoffs = self._handoff_rows()
+            reason, handoffs = self._store.snapshot()
             pending = len(self._flows)
             last_export = self._last_export
         rows = []
-        for name, size, mtime in handoffs:
-            rows.append(
-                {
-                    "age_seconds": int(self._now() - mtime),
-                    "bytes": size,
-                    "name": name,
-                }
-            )
+        for name, size, exported in handoffs:
+            row = {"bytes": size, "name": name}
+            if exported is not None:
+                row["age_seconds"] = int(self._now() - exported)
+            rows.append(row)
         return {
             "blocked": reason,
             "handoffs": rows,
@@ -289,25 +464,11 @@ class Broker:  # pylint: disable=too-many-instance-attributes
             "pending": pending,
         }
 
-    def directory_problem(self):
-        path = self._handoff
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            return "missing"
-        except OSError:
+    def ready_problem(self):
+        reason, _rows = self._store.snapshot()
+        if reason == "unavailable":
             return "unavailable"
-        if stat.S_ISLNK(info.st_mode):
-            return "symlink"
-        if not stat.S_ISDIR(info.st_mode):
-            return "not-directory"
-        if info.st_uid != os.getuid() or info.st_gid != os.getgid():
-            reason = "owner"
-        elif stat.S_IMODE(info.st_mode) != 0o700:
-            reason = "mode"
-        else:
-            reason = None
-        return reason
+        return None
 
     def _exchange_code(self, flow, code):
         form = {
@@ -350,116 +511,18 @@ class Broker:  # pylint: disable=too-many-instance-attributes
             del self._flows[state]
 
     def _block_reason(self):
-        problem = self.directory_problem()
-        if problem is not None:
-            return problem
-        return self._handoff_reason()
-
-    def _handoff_reason(self):  # pylint: disable=too-many-return-statements
-        partial = False
-        count = 0
-        oldest = None
-        try:
-            entries = os.scandir(self._handoff)
-        except OSError:
-            return "unavailable"
-        with entries:
-            for entry in entries:
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                except OSError:
-                    return "unavailable"
-                if stat.S_ISLNK(info.st_mode):
-                    return "symlink"
-                if not stat.S_ISREG(info.st_mode):
-                    return "unexpected-entry"
-                if entry.name.startswith("."):
-                    partial = True
-                    continue
-                count += 1
-                if oldest is None or info.st_mtime < oldest:
-                    oldest = info.st_mtime
-        if partial:
-            return "partial"
-        if count > MAX_HANDOFFS:
-            return "outstanding"
-        if count == 0:
-            return None
-        if self._now() - oldest >= HANDOFF_TTL_SECONDS:
-            return "expired"
-        return "outstanding"
-
-    def _handoff_rows(self):
-        rows = []
-        try:
-            entries = os.scandir(self._handoff)
-        except OSError:
-            return rows
-        with entries:
-            for entry in entries:
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                    continue
-                if entry.name.startswith("."):
-                    continue
-                rows.append((entry.name, info.st_size, info.st_mtime))
-        rows.sort()
-        return rows
+        reason, _rows = self._store.snapshot()
+        return reason
 
     def _publish(self, payload):
         with self._lock:
-            if self._block_reason() is not None:
-                raise HandoffBlocked
-            partial_name = ".partial-" + secrets.token_hex(8)
-            final_name = "handoff-" + secrets.token_hex(8)
-            partial = self._handoff / partial_name
-            final = self._handoff / final_name
-            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            try:
-                descriptor = os.open(partial, flags, 0o600)
-            except OSError:
-                raise HandoffBlocked from None
-            try:
-                os.fchmod(descriptor, 0o600)
-                view = memoryview(payload)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError
-                    view = view[written:]
-                os.fsync(descriptor)
-            except OSError:
-                os.close(descriptor)
-                _unlink(partial)
-                raise HandoffBlocked from None
-            os.close(descriptor)
-            try:
-                os.link(partial, final)
-            except OSError:
-                _unlink(partial)
-                raise HandoffBlocked from None
-            directory = os.open(self._handoff, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-            _unlink(partial)
+            self._store.publish(payload)
 
     def _mark(self, result):
         with self._lock:
             self._last_export = result
             if result == "failed":
                 _LOG.info("export-failed")
-
-
-def _unlink(path):
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
 
 
 def _parse_query(query):
@@ -543,7 +606,7 @@ class _Handler(BaseHTTPRequestHandler):  # pylint: disable=invalid-name
             self._send(200, b"ok")
             return
         if parsed.path == "/readyz":
-            problem = self.server.broker.directory_problem()
+            problem = self.server.broker.ready_problem()
             if problem is None:
                 self._send(200, b"ok")
                 return
@@ -645,12 +708,23 @@ def serve(broker, public_host, public_port, private_host, private_port):
 
 def main():
     path = os.environ.get("ETSY_KEYSTRING_FILE", "/run/secrets/etsy/keystring")
-    handoff = os.environ.get("ETSY_HANDOFF_DIR", "/handoff")
+    namespace = os.environ.get("ETSY_NAMESPACE", "etsy")
+    secret_name = os.environ.get("ETSY_REFRESH_SECRET", REFRESH_SECRET_NAME)
+    api = os.environ.get("KUBERNETES_API", "https://kubernetes.default.svc")
+    token_path = os.environ.get(
+        "KUBERNETES_TOKEN_FILE",
+        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    )
+    ca_path = os.environ.get(
+        "KUBERNETES_CA_FILE",
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+    )
     try:
         keystring = load_keystring(path)
     except OSError:
         raise SystemExit(2) from None
-    broker = Broker(keystring, handoff)
+    store = SecretStore(namespace, secret_name, api, token_path, ca_path, time.time)
+    broker = Broker(keystring, store)
     serve(broker, "0.0.0.0", 8080, "127.0.0.1", 8091)
 
 

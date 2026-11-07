@@ -1,14 +1,11 @@
+import base64
 import http.client
 import json
 import logging
-import os
-import stat
-import tempfile
 import threading
 import time
 import unittest
 import urllib.parse
-from pathlib import Path
 
 import broker
 
@@ -42,12 +39,38 @@ def good_exchange(form):
     return 200, "application/json", token_body()
 
 
+class MemoryStore:
+
+    def __init__(self):
+        self.record = None
+        self.down = False
+        self._now = time.time
+
+    def bind(self, now):
+        self._now = now
+
+    def snapshot(self):
+        if self.down:
+            return "unavailable", []
+        if self.record is None:
+            return None, []
+        payload, exported = self.record
+        row = (broker.REFRESH_SECRET_NAME, len(payload), exported)
+        if self._now() - exported >= broker.HANDOFF_TTL_SECONDS:
+            return "expired", [row]
+        return "outstanding", [row]
+
+    def publish(self, payload):
+        reason, _rows = self.snapshot()
+        if reason is not None:
+            raise broker.HandoffBlocked
+        self.record = (bytes(payload), self._now())
+
+
 class BrokerCase(unittest.TestCase):
 
     def setUp(self):
-        # pylint: disable-next=consider-using-with
-        self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name)
+        self.store = MemoryStore()
         self.logs = []
         self.handler = logging.Handler()
         self.handler.emit = self.logs.append
@@ -57,12 +80,11 @@ class BrokerCase(unittest.TestCase):
 
     def tearDown(self):
         logging.getLogger("etsy.oauth").removeHandler(self.handler)
-        self.temporary.cleanup()
 
     def _make(self, **kwargs):
         values = {"exchange": good_exchange}
         values.update(kwargs)
-        return broker.Broker(KEY, self.directory, **values)
+        return broker.Broker(KEY, self.store, **values)
 
     def _log_text(self):
         return " ".join(record.getMessage() for record in self.logs)
@@ -165,11 +187,7 @@ class BrokerCase(unittest.TestCase):
         request = broker.token_request(seen)
         self.assertEqual(broker.TOKEN_ENDPOINT, request.full_url)
         self.assertNotIn(b"client_secret", request.data)
-        written = list(self.directory.iterdir())
-        self.assertEqual(1, len(written))
-        self.assertEqual(REFRESH.encode("ascii"), written[0].read_bytes())
-        self.assertFalse(written[0].name.startswith("."))
-        self.assertEqual(0o600, stat.S_IMODE(written[0].stat().st_mode))
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
         self._assert_clean(state)
 
     def test_bad_state_leaves_a_valid_flow(self):
@@ -187,7 +205,7 @@ class BrokerCase(unittest.TestCase):
             instance.callback("code=one&code=two&state=" + state),
         )
         self.assertIn(state, instance._flows)
-        self.assertEqual([], list(self.directory.iterdir()))
+        self.assertIsNone(self.store.record)
 
     def test_expired_state_does_not_drop_another_flow(self):
         clock = {"now": 0}
@@ -227,7 +245,7 @@ class BrokerCase(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(1, calls["count"])
-        self.assertEqual(1, len(list(self.directory.iterdir())))
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
         self.assertIn((200, b"ok"), results)
         self.assertIn((400, b"error"), results)
 
@@ -259,7 +277,7 @@ class BrokerCase(unittest.TestCase):
                 instance = self._make(exchange=exchange)
                 callback, _state, _verifier = self._callback_of(instance)
                 self.assertEqual((500, b"error"), instance.callback(callback))
-                self.assertEqual([], list(self.directory.iterdir()))
+                self.assertIsNone(self.store.record)
                 self.assertEqual("failed", instance.status()["last_export"])
                 self.assertNotIn(DETAIL, json.dumps(instance.status()))
                 self.assertNotIn(REFRESH, json.dumps(instance.status()))
@@ -278,7 +296,7 @@ class BrokerCase(unittest.TestCase):
         callback, _state, _verifier = self._callback_of(instance)
         self.assertEqual((500, b"error"), instance.callback(callback))
         self._assert_clean()
-        self.assertEqual([], list(self.directory.iterdir()))
+        self.assertIsNone(self.store.record)
 
     def test_second_handoff_does_not_replace_the_first(self):
         first = self._make(
@@ -286,7 +304,7 @@ class BrokerCase(unittest.TestCase):
         )
         callback, _state, _verifier = self._callback_of(first)
         self.assertEqual((200, b"ok"), first.callback(callback))
-        original = next(self.directory.iterdir()).read_bytes()
+        original = self.store.record[0]
         second = self._make(
             exchange=lambda _form: (
                 200,
@@ -297,54 +315,30 @@ class BrokerCase(unittest.TestCase):
         status, payload = second.start_flow()
         self.assertEqual(409, status)
         self.assertEqual("outstanding", payload["error"])
-        self.assertEqual(
-            [original], [path.read_bytes() for path in self.directory.iterdir()]
-        )
+        self.assertEqual(original, self.store.record[0])
         self.assertNotIn("OTHERTOKENSENTINEL", json.dumps(second.status()))
 
-    def test_restart_ignores_existing_bytes_and_expired_files_stay(self):
-        existing = self.directory / "handoff-existing"
-        existing.write_bytes(REFRESH.encode("ascii"))
-        os.chmod(existing, 0o600)
+    def test_restart_reports_metadata_and_expired_tokens_stay(self):
+        self.store.record = (REFRESH.encode("ascii"), time.time())
         restarted = self._make()
         status = restarted.status()
         self.assertEqual("outstanding", status["blocked"])
         self.assertEqual(len(REFRESH), status["handoffs"][0]["bytes"])
+        self.assertEqual(broker.REFRESH_SECRET_NAME, status["handoffs"][0]["name"])
         self.assertNotIn(REFRESH, json.dumps(status))
-        old = time.time() - broker.HANDOFF_TTL_SECONDS - 5
-        os.utime(existing, (old, old))
-        aged = self._make(now=lambda: old + broker.HANDOFF_TTL_SECONDS + 10)
+        exported = 1_700_000_000
+        self.store.record = (REFRESH.encode("ascii"), exported)
+        aged = self._make(now=lambda: exported + broker.HANDOFF_TTL_SECONDS + 10)
         self.assertEqual("expired", aged.status()["blocked"])
-        self.assertEqual(REFRESH.encode("ascii"), existing.read_bytes())
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
         self.assertEqual(409, aged.start_flow()[0])
 
-    def test_partial_blocks_without_a_read_of_its_bytes(self):
-        partial = self.directory / ".partial-left"
-        partial.write_bytes(REFRESH.encode("ascii"))
+    def test_api_down_blocks_without_a_write(self):
+        self.store.down = True
         instance = self._make()
-        status = instance.status()
-        self.assertEqual("partial", status["blocked"])
-        self.assertEqual([], status["handoffs"])
-        self.assertNotIn(REFRESH, json.dumps(status))
+        self.assertEqual("unavailable", instance.ready_problem())
         self.assertEqual(409, instance.start_flow()[0])
-
-    def test_directory_failures(self):
-        outside = Path(self.temporary.name + "-link")
-        outside.mkdir()
-        self.addCleanup(outside.rmdir)
-        link = self.directory / "linked"
-        link.symlink_to(outside, target_is_directory=True)
-        linked = broker.Broker(KEY, link, exchange=good_exchange)
-        self.assertEqual("symlink", linked.directory_problem())
-        self.assertEqual(409, linked.start_flow()[0])
-        loose = Path(self.temporary.name + "-loose")
-        loose.mkdir()
-        loose.chmod(0o755)
-        self.addCleanup(loose.rmdir)
-        opened = broker.Broker(KEY, loose, exchange=good_exchange)
-        self.assertEqual("mode", opened.directory_problem())
-        missing = broker.Broker(KEY, self.directory / "missing", exchange=good_exchange)
-        self.assertEqual("missing", missing.directory_problem())
+        self.assertIsNone(self.store.record)
 
     def test_pending_and_callback_limits(self):
         instance = self._make(max_pending=1, callback_limit=1)
@@ -431,12 +425,173 @@ class BrokerCase(unittest.TestCase):
             {
                 key: value
                 for key, value in instance.__dict__.items()
-                if key != "_keystring"
+                if key not in ("_keystring", "_store")
             },
             default=str,
         )
         self.assertNotIn(ACCESS, stored)
         self.assertNotIn(REFRESH, stored)
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
+
+
+def _secret_store(opener, now):
+    return broker.SecretStore(
+        "etsy",
+        broker.REFRESH_SECRET_NAME,
+        "https://kubernetes.default.svc",
+        "/no-token",
+        "/no-ca",
+        now,
+        opener=opener,
+    )
+
+
+def _stored_secret(exported, refresh=REFRESH, extra=None):
+    raw = base64.b64encode(refresh.encode("ascii")).decode("ascii")
+    data = {broker.REFRESH_DATA_KEY: raw}
+    if extra:
+        data.update(extra)
+    return {
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": broker.REFRESH_SECRET_NAME,
+            "annotations": {broker.EXPORTED_AT: str(exported)},
+        },
+        "data": data,
+    }
+
+
+class SecretCase(unittest.TestCase):
+
+    def test_document_holds_only_the_refresh_token(self):
+        document = broker.secret_document(
+            broker.REFRESH_SECRET_NAME,
+            "etsy",
+            REFRESH.encode("ascii"),
+            100,
+        )
+        decoded = base64.b64decode(document["data"][broker.REFRESH_DATA_KEY])
+        self.assertEqual(REFRESH.encode("ascii"), decoded)
+        text = json.dumps(document)
+        self.assertNotIn(ACCESS, text)
+        self.assertNotIn("access_token", text)
+        self.assertEqual("100", document["metadata"]["annotations"][broker.EXPORTED_AT])
+
+    def test_publish_posts_one_secret_and_discards_the_response(self):
+        calls = []
+
+        def opener(method, url, body):
+            calls.append((method, url, body))
+            if method == "GET":
+                return 404, b'{"kind":"Status"}'
+            return 201, json.dumps(_stored_secret(100)).encode("utf-8")
+
+        store = _secret_store(opener, lambda: 100)
+        store.publish(REFRESH.encode("ascii"))
+        self.assertEqual(["GET", "POST"], [call[0] for call in calls])
+        self.assertEqual(
+            "https://kubernetes.default.svc/api/v1/namespaces/etsy/secrets",
+            calls[1][1],
+        )
+        posted = json.loads(calls[1][2].decode("utf-8"))
+        self.assertEqual(
+            REFRESH.encode("ascii"),
+            base64.b64decode(posted["data"][broker.REFRESH_DATA_KEY]),
+        )
+        self.assertNotIn(ACCESS, calls[1][2].decode("utf-8"))
+        self.assertNotIn(REFRESH, _store_text(store))
+
+    def test_existing_secret_is_not_replaced(self):
+        calls = []
+
+        def opener(method, url, body):
+            calls.append(method)
+            del url, body
+            return 200, json.dumps(_stored_secret(100)).encode("utf-8")
+
+        store = _secret_store(opener, lambda: 150)
+        reason, rows = store.snapshot()
+        self.assertEqual("outstanding", reason)
+        self.assertEqual(len(REFRESH), rows[0][1])
+        self.assertNotIn(REFRESH, json.dumps(rows))
+        with self.assertRaises(broker.HandoffBlocked):
+            store.publish(b"OTHERTOKENSENTINEL")
+        self.assertEqual(["GET", "GET"], calls)
+
+    def test_expired_secret_is_not_deleted(self):
+        calls = []
+
+        def opener(method, url, body):
+            calls.append(method)
+            del url, body
+            return 200, json.dumps(_stored_secret(100)).encode("utf-8")
+
+        store = _secret_store(opener, lambda: 100 + broker.HANDOFF_TTL_SECONDS + 1)
+        reason, _rows = store.snapshot()
+        self.assertEqual("expired", reason)
+        with self.assertRaises(broker.HandoffBlocked):
+            store.publish(b"next")
+        self.assertNotIn("DELETE", calls)
+        self.assertNotIn("PUT", calls)
+        self.assertNotIn("PATCH", calls)
+
+    def test_conflict_does_not_overwrite(self):
+        calls = []
+
+        def opener(method, url, body):
+            calls.append(method)
+            del url, body
+            if method == "GET":
+                return 404, b""
+            return 409, json.dumps(_stored_secret(100)).encode("utf-8")
+
+        store = _secret_store(opener, lambda: 100)
+        with self.assertRaises(broker.HandoffBlocked):
+            store.publish(REFRESH.encode("ascii"))
+        self.assertEqual(["GET", "POST"], calls)
+        self.assertNotIn(REFRESH, _store_text(store))
+
+    def test_unexpected_shape_blocks_without_a_post(self):
+        calls = []
+        document = _stored_secret(100, extra={"note": "nope"})
+
+        def opener(method, url, body):
+            calls.append(method)
+            del url, body
+            return 200, json.dumps(document).encode("utf-8")
+
+        store = _secret_store(opener, lambda: 100)
+        reason, rows = store.snapshot()
+        self.assertEqual("unexpected", reason)
+        self.assertEqual([], rows)
+        with self.assertRaises(broker.HandoffBlocked):
+            store.publish(b"next")
+        self.assertEqual(["GET", "GET"], calls)
+        self.assertNotIn(REFRESH, json.dumps(rows))
+
+    def test_missing_annotation_stays_outstanding(self):
+        document = _stored_secret(100)
+        document["metadata"]["annotations"] = {}
+
+        def opener(method, url, body):
+            del method, url, body
+            return 200, json.dumps(document).encode("utf-8")
+
+        store = _secret_store(opener, lambda: 100)
+        reason, rows = store.snapshot()
+        self.assertEqual("outstanding", reason)
+        self.assertIsNone(rows[0][2])
+        self.assertNotIn(REFRESH, json.dumps(rows))
+
+
+def _store_text(store):
+    visible = {
+        key: value
+        for key, value in store.__dict__.items()
+        if key not in ("_opener", "_now")
+    }
+    return json.dumps(visible)
 
 
 def _request(port, method, path, headers=None):
