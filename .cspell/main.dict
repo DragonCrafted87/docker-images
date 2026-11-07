@@ -37,6 +37,7 @@ checksummed
 cloudflare
 cni
 colls
+configmap
 dateutc
 dateutil
 dbname
@@ -98,9 +99,11 @@ pyc
 pylintrc
 qos
 ramdisk
+rawfile
 rconhost
 readyz
 sed
+serviceaccount
 shm
 speedtest
 sprintf

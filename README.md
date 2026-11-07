@@ -44,6 +44,12 @@ A tag `speedtest-mqtt-v2.1.0` publishes the image as `2.1.0`. Pushes to `main` p
 
 A tag `hermes-v0.22.2-screen` publishes the image as `0.22.2-screen`. Pushes to `main` publish `edge`.
 
+## auth-keys
+
+`auth-keys/` builds `ghcr.io/dragoncrafted87/alpine-auth-keys:edge` from Alpine 3.24. The cron command fetches the GitHub key list, publishes it, and pushes it to hosts that cannot fetch it. The server command serves that file on port 8080 with busybox httpd from busybox-extras.
+
+A push to `main` publishes `edge`.
+
 ## etsy-oauth-broker
 
 `etsy-oauth-broker/` builds `ghcr.io/dragoncrafted87/etsy-oauth-broker` from Alpine 3.24. It runs one Etsy authorization-code consent and writes the raw refresh token into a handoff directory.
