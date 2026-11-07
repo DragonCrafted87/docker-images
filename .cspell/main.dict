@@ -30,6 +30,7 @@ checksummed
 cloudflare
 cni
 colls
+configmap
 dateutc
 dateutil
 dbname
@@ -85,8 +86,10 @@ psql
 pylintrc
 qos
 ramdisk
+rawfile
 rconhost
 sed
+serviceaccount
 shm
 speedtest
 sprintf
