@@ -51,20 +51,21 @@ class MemoryStore:
 
     def snapshot(self):
         if self.down:
-            return "unavailable", []
+            return "unavailable", broker._empty_tokens()
         if self.record is None:
-            return None, []
-        payload, exported = self.record
-        row = (broker.REFRESH_SECRET_NAME, len(payload), exported)
-        if self._now() - exported >= broker.HANDOFF_TTL_SECONDS:
-            return "expired", [row]
-        return "outstanding", [row]
+            return None, broker._empty_tokens()
+        access, refresh, expires_at = self.record
+        return None, broker._token_view(access, refresh, expires_at)
 
-    def publish(self, payload):
-        reason, _rows = self.snapshot()
-        if reason is not None:
-            raise broker.HandoffBlocked
-        self.record = (bytes(payload), self._now())
+    def current(self):
+        if self.down:
+            raise broker.StoreError
+        if self.record is None:
+            return None, None, None
+        return self.record
+
+    def publish(self, access, refresh, expires_at):
+        self.record = (bytes(access), bytes(refresh), expires_at)
 
 
 class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
@@ -126,7 +127,8 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
         callback, _state, _verifier = self._callback_of(instance)
         issued = callback + "&iss=" + urllib.parse.quote(broker.ISSUER, safe="")
         self.assertEqual((200, b"ok"), instance.callback(issued))
-        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
+        self.assertEqual(ACCESS.encode("ascii"), self.store.record[0])
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[1])
         self.assertNotIn(broker.ISSUER, self._log_text())
 
     def test_wrong_issuer_does_not_consume_the_flow(self):
@@ -214,7 +216,8 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
         request = broker.token_request(seen)
         self.assertEqual(broker.TOKEN_ENDPOINT, request.full_url)
         self.assertNotIn(b"client_secret", request.data)
-        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
+        self.assertEqual(ACCESS.encode("ascii"), self.store.record[0])
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[1])
         self._assert_clean(state)
 
     def test_bad_state_leaves_a_valid_flow(self):
@@ -272,7 +275,8 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
         for thread in threads:
             thread.join()
         self.assertEqual(1, calls["count"])
-        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
+        self.assertEqual(ACCESS.encode("ascii"), self.store.record[0])
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[1])
         self.assertIn((200, b"ok"), results)
         self.assertIn((400, b"error"), results)
 
@@ -325,13 +329,12 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
         self._assert_clean()
         self.assertIsNone(self.store.record)
 
-    def test_second_handoff_does_not_replace_the_first(self):
+    def test_second_consent_replaces_the_tokens(self):
         first = self._make(
             exchange=lambda _form: (200, "application/json", token_body())
         )
         callback, _state, _verifier = self._callback_of(first)
         self.assertEqual((200, b"ok"), first.callback(callback))
-        original = self.store.record[0]
         second = self._make(
             exchange=lambda _form: (
                 200,
@@ -339,26 +342,40 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
                 token_body(refresh="OTHERTOKENSENTINEL"),
             )
         )
-        status, payload = second.start_flow()
-        self.assertEqual(409, status)
-        self.assertEqual("outstanding", payload["error"])
-        self.assertEqual(original, self.store.record[0])
+        callback, _state, _verifier = self._callback_of(second)
+        self.assertEqual((200, b"ok"), second.callback(callback))
+        self.assertEqual(b"OTHERTOKENSENTINEL", self.store.record[1])
         self.assertNotIn("OTHERTOKENSENTINEL", json.dumps(second.status()))
 
-    def test_restart_reports_metadata_and_expired_tokens_stay(self):
-        self.store.record = (REFRESH.encode("ascii"), time.time())
-        restarted = self._make()
-        status = restarted.status()
-        self.assertEqual("outstanding", status["blocked"])
-        self.assertEqual(len(REFRESH), status["handoffs"][0]["bytes"])
-        self.assertEqual(broker.REFRESH_SECRET_NAME, status["handoffs"][0]["name"])
-        self.assertNotIn(REFRESH, json.dumps(status))
-        exported = 1_700_000_000
-        self.store.record = (REFRESH.encode("ascii"), exported)
-        aged = self._make(now=lambda: exported + broker.HANDOFF_TTL_SECONDS + 10)
-        self.assertEqual("expired", aged.status()["blocked"])
-        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
-        self.assertEqual(409, aged.start_flow()[0])
+    def test_refresh_waits_until_the_lead_and_then_rotates(self):
+        calls = {"count": 0}
+
+        def exchange(form):
+            calls["count"] += 1
+            self.assertEqual("refresh_token", form["grant_type"])
+            self.assertNotIn("client_secret", form)
+            return 200, "application/json", token_body(refresh="OTHERTOKENSENTINEL")
+
+        now = 1_000_000
+        self.store.record = (
+            ACCESS.encode("ascii"),
+            REFRESH.encode("ascii"),
+            now + 3600,
+        )
+        waiting = self._make(exchange=exchange, now=lambda: now)
+        waiting.refresh_if_due()
+        self.assertEqual(0, calls["count"])
+        due = self._make(
+            exchange=exchange,
+            now=lambda: now + 3600 - broker.REFRESH_LEAD_SECONDS,
+        )
+        due.refresh_if_due()
+        self.assertEqual(1, calls["count"])
+        self.assertEqual(b"OTHERTOKENSENTINEL", self.store.record[1])
+        text = json.dumps(due.status())
+        self.assertNotIn(REFRESH, text)
+        self.assertNotIn("OTHERTOKENSENTINEL", text)
+        self.assertIn("refresh-completed", self._log_text())
 
     def test_api_down_blocks_without_a_write(self):
         self.store.down = True
@@ -458,13 +475,15 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
         )
         self.assertNotIn(ACCESS, stored)
         self.assertNotIn(REFRESH, stored)
-        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
+        self.assertEqual(ACCESS.encode("ascii"), self.store.record[0])
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[1])
 
 
 def _secret_store(opener, now):
     return broker.SecretStore(
         "etsy",
         broker.REFRESH_SECRET_NAME,
+        broker.ACCESS_SECRET_NAME,
         "https://kubernetes.default.svc",
         "/no-token",
         "/no-ca",
@@ -473,17 +492,18 @@ def _secret_store(opener, now):
     )
 
 
-def _stored_secret(exported, refresh=REFRESH, extra=None):
-    raw = base64.b64encode(refresh.encode("ascii")).decode("ascii")
-    data = {broker.REFRESH_DATA_KEY: raw}
+def _stored_secret(name, key, value, expires_at, extra=None):
+    raw = base64.b64encode(value).decode("ascii")
+    data = {key: raw}
     if extra:
         data.update(extra)
     return {
         "kind": "Secret",
         "type": "Opaque",
         "metadata": {
-            "name": broker.REFRESH_SECRET_NAME,
-            "annotations": {broker.EXPORTED_AT: str(exported)},
+            "name": name,
+            "resourceVersion": "7",
+            "annotations": {broker.EXPIRES_AT: str(expires_at)},
         },
         "data": data,
     }
@@ -491,97 +511,88 @@ def _stored_secret(exported, refresh=REFRESH, extra=None):
 
 class SecretCase(unittest.TestCase):
 
-    def test_document_holds_only_the_refresh_token(self):
+    def test_document_holds_one_token(self):
         document = broker.secret_document(
-            broker.REFRESH_SECRET_NAME,
+            broker.ACCESS_SECRET_NAME,
             "etsy",
-            REFRESH.encode("ascii"),
+            broker.ACCESS_DATA_KEY,
+            ACCESS.encode("ascii"),
             100,
         )
-        decoded = base64.b64decode(document["data"][broker.REFRESH_DATA_KEY])
-        self.assertEqual(REFRESH.encode("ascii"), decoded)
+        decoded = base64.b64decode(document["data"][broker.ACCESS_DATA_KEY])
+        self.assertEqual(ACCESS.encode("ascii"), decoded)
         text = json.dumps(document)
-        self.assertNotIn(ACCESS, text)
-        self.assertNotIn("access_token", text)
-        self.assertEqual("100", document["metadata"]["annotations"][broker.EXPORTED_AT])
+        self.assertNotIn(REFRESH, text)
+        self.assertEqual("100", document["metadata"]["annotations"][broker.EXPIRES_AT])
 
-    def test_publish_posts_one_secret_and_discards_the_response(self):
+    def test_publish_writes_refresh_before_access(self):
         calls = []
 
         def opener(method, url, body):
             calls.append((method, url, body))
             if method == "GET":
-                return 404, b'{"kind":"Status"}'
-            return 201, json.dumps(_stored_secret(100)).encode("utf-8")
+                return 404, b"{}"
+            return 201, b"{}"
 
         store = _secret_store(opener, lambda: 100)
-        store.publish(REFRESH.encode("ascii"))
-        self.assertEqual(["GET", "POST"], [call[0] for call in calls])
-        self.assertEqual(
-            "https://kubernetes.default.svc/api/v1/namespaces/etsy/secrets",
-            calls[1][1],
-        )
-        posted = json.loads(calls[1][2].decode("utf-8"))
-        self.assertEqual(
-            REFRESH.encode("ascii"),
-            base64.b64decode(posted["data"][broker.REFRESH_DATA_KEY]),
-        )
-        self.assertNotIn(ACCESS, calls[1][2].decode("utf-8"))
+        store.publish(ACCESS.encode("ascii"), REFRESH.encode("ascii"), 5000)
+        self.assertEqual(["GET", "POST", "GET", "POST"], [call[0] for call in calls])
+        refresh_body = json.loads(calls[1][2].decode("utf-8"))
+        access_body = json.loads(calls[3][2].decode("utf-8"))
+        self.assertIn(broker.REFRESH_DATA_KEY, refresh_body["data"])
+        self.assertNotIn(broker.ACCESS_DATA_KEY, refresh_body["data"])
+        self.assertIn(broker.ACCESS_DATA_KEY, access_body["data"])
+        self.assertNotIn(broker.REFRESH_DATA_KEY, access_body["data"])
         self.assertNotIn(REFRESH, _store_text(store))
+        self.assertNotIn(ACCESS, _store_text(store))
 
-    def test_existing_secret_is_not_replaced(self):
+    def test_existing_secrets_are_updated(self):
         calls = []
 
         def opener(method, url, body):
-            calls.append(method)
-            del url, body
-            return 200, json.dumps(_stored_secret(100)).encode("utf-8")
+            calls.append((method, url))
+            if method == "GET" and url.endswith("/" + broker.REFRESH_SECRET_NAME):
+                document = _stored_secret(
+                    broker.REFRESH_SECRET_NAME,
+                    broker.REFRESH_DATA_KEY,
+                    REFRESH.encode("ascii"),
+                    100,
+                )
+                return 200, json.dumps(document).encode("utf-8")
+            if method == "GET" and url.endswith("/" + broker.ACCESS_SECRET_NAME):
+                document = _stored_secret(
+                    broker.ACCESS_SECRET_NAME,
+                    broker.ACCESS_DATA_KEY,
+                    ACCESS.encode("ascii"),
+                    100,
+                )
+                return 200, json.dumps(document).encode("utf-8")
+            if method == "PUT":
+                posted = json.loads(body.decode("utf-8"))
+                self.assertEqual("7", posted["metadata"]["resourceVersion"])
+                return 200, b"{}"
+            return 500, b""
 
         store = _secret_store(opener, lambda: 150)
-        reason, rows = store.snapshot()
-        self.assertEqual("outstanding", reason)
-        self.assertEqual(len(REFRESH), rows[0][1])
-        self.assertNotIn(REFRESH, json.dumps(rows))
-        with self.assertRaises(broker.HandoffBlocked):
-            store.publish(b"OTHERTOKENSENTINEL")
-        self.assertEqual(["GET", "GET"], calls)
+        reason, view = store.snapshot()
+        self.assertIsNone(reason)
+        self.assertTrue(view["has_access"])
+        self.assertEqual(len(REFRESH), view["refresh_bytes"])
+        self.assertNotIn(REFRESH, json.dumps(view))
+        calls.clear()
+        store.publish(b"new-access", b"new-refresh", 9000)
+        self.assertEqual(["GET", "PUT", "GET", "PUT"], [call[0] for call in calls])
+        self.assertNotIn("DELETE", [call[0] for call in calls])
 
-    def test_expired_secret_is_not_deleted(self):
+    def test_unexpected_shape_does_not_post(self):
         calls = []
-
-        def opener(method, url, body):
-            calls.append(method)
-            del url, body
-            return 200, json.dumps(_stored_secret(100)).encode("utf-8")
-
-        store = _secret_store(opener, lambda: 100 + broker.HANDOFF_TTL_SECONDS + 1)
-        reason, _rows = store.snapshot()
-        self.assertEqual("expired", reason)
-        with self.assertRaises(broker.HandoffBlocked):
-            store.publish(b"next")
-        self.assertNotIn("DELETE", calls)
-        self.assertNotIn("PUT", calls)
-        self.assertNotIn("PATCH", calls)
-
-    def test_conflict_does_not_overwrite(self):
-        calls = []
-
-        def opener(method, url, body):
-            calls.append(method)
-            del url, body
-            if method == "GET":
-                return 404, b""
-            return 409, json.dumps(_stored_secret(100)).encode("utf-8")
-
-        store = _secret_store(opener, lambda: 100)
-        with self.assertRaises(broker.HandoffBlocked):
-            store.publish(REFRESH.encode("ascii"))
-        self.assertEqual(["GET", "POST"], calls)
-        self.assertNotIn(REFRESH, _store_text(store))
-
-    def test_unexpected_shape_blocks_without_a_post(self):
-        calls = []
-        document = _stored_secret(100, extra={"note": "nope"})
+        document = _stored_secret(
+            broker.REFRESH_SECRET_NAME,
+            broker.REFRESH_DATA_KEY,
+            REFRESH.encode("ascii"),
+            100,
+            extra={"note": "nope"},
+        )
 
         def opener(method, url, body):
             calls.append(method)
@@ -589,27 +600,14 @@ class SecretCase(unittest.TestCase):
             return 200, json.dumps(document).encode("utf-8")
 
         store = _secret_store(opener, lambda: 100)
-        reason, rows = store.snapshot()
-        self.assertEqual("unexpected", reason)
-        self.assertEqual([], rows)
-        with self.assertRaises(broker.HandoffBlocked):
-            store.publish(b"next")
-        self.assertEqual(["GET", "GET"], calls)
-        self.assertNotIn(REFRESH, json.dumps(rows))
-
-    def test_missing_annotation_stays_outstanding(self):
-        document = _stored_secret(100)
-        document["metadata"]["annotations"] = {}
-
-        def opener(method, url, body):
-            del method, url, body
-            return 200, json.dumps(document).encode("utf-8")
-
-        store = _secret_store(opener, lambda: 100)
-        reason, rows = store.snapshot()
-        self.assertEqual("outstanding", reason)
-        self.assertIsNone(rows[0][2])
-        self.assertNotIn(REFRESH, json.dumps(rows))
+        reason, view = store.snapshot()
+        self.assertEqual("unavailable", reason)
+        self.assertFalse(view["has_refresh"])
+        calls.clear()
+        store.publish(b"next-access", b"next-refresh", 2000)
+        self.assertNotIn("POST", calls)
+        self.assertIn("PUT", calls)
+        self.assertNotIn(REFRESH, json.dumps(view))
 
 
 def _store_text(store):

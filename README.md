@@ -52,7 +52,7 @@ A push to `main` publishes `edge`.
 
 ## etsy-oauth-broker
 
-`etsy-oauth-broker/` builds `ghcr.io/dragoncrafted87/etsy-oauth-broker` from Alpine 3.24. It runs one Etsy authorization-code consent and writes the raw refresh token into one namespace Secret.
+`etsy-oauth-broker/` builds `ghcr.io/dragoncrafted87/etsy-oauth-broker` from Alpine 3.24. It keeps an Etsy access token and refresh token in namespace Secrets and refreshes the access token.
 
 A tag `etsy-oauth-broker-v1.0.0` publishes the image as `1.0.0`. Pushes to `main` publish `edge`.
 

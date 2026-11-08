@@ -40,7 +40,10 @@ CALLBACK_LIMIT = 30
 CALLBACK_WINDOW_SECONDS = 60
 REFRESH_SECRET_NAME = "etsy-refresh-token"
 REFRESH_DATA_KEY = "refresh-token"
-EXPORTED_AT = "etsy.stealthdragonland.net/exported-at"
+ACCESS_SECRET_NAME = "etsy-access-token"
+ACCESS_DATA_KEY = "access-token"
+EXPIRES_AT = "etsy.stealthdragonland.net/expires-at"
+REFRESH_LEAD_SECONDS = 300
 MAX_SECRET_BODY = 65536
 
 _LOG = logging.getLogger("etsy.oauth")
@@ -136,7 +139,37 @@ def token_request(form):
     )
 
 
-def accepted_refresh(status, content_type, body):
+def _empty_tokens():
+    return {
+        "access_bytes": 0,
+        "expires_at": None,
+        "has_access": False,
+        "has_refresh": False,
+        "refresh_bytes": 0,
+    }
+
+
+def _token_view(access, refresh, expires_at):
+    return {
+        "access_bytes": 0 if access is None else len(access),
+        "expires_at": expires_at,
+        "has_access": access is not None,
+        "has_refresh": refresh is not None,
+        "refresh_bytes": 0 if refresh is None else len(refresh),
+    }
+
+
+def _token_bytes(value, limit):
+    if not isinstance(value, str):
+        raise ExchangeFailed
+    if not value.isascii() or not 1 <= len(value) <= limit:
+        raise ExchangeFailed
+    if any(ord(character) < 33 or ord(character) == 127 for character in value):
+        raise ExchangeFailed
+    return value.encode("ascii")
+
+
+def accepted_tokens(status, content_type, body):
     if status != 200 or len(body) > MAX_TOKEN_BODY:
         raise ExchangeFailed
     media = content_type.split(";", 1)[0].strip().lower()
@@ -163,14 +196,9 @@ def accepted_refresh(status, content_type, body):
         raise ExchangeFailed
     if set(parsed["scope"].split()) != set(SCOPES.split()):
         raise ExchangeFailed
-    refresh = parsed["refresh_token"]
-    if not isinstance(refresh, str):
-        raise ExchangeFailed
-    if not refresh.isascii() or not 1 <= len(refresh) <= MAX_REFRESH_BYTES:
-        raise ExchangeFailed
-    if any(ord(character) < 33 or ord(character) == 127 for character in refresh):
-        raise ExchangeFailed
-    return refresh.encode("ascii")
+    access = _token_bytes(parsed["access_token"], MAX_REFRESH_BYTES)
+    refresh = _token_bytes(parsed["refresh_token"], MAX_REFRESH_BYTES)
+    return access, refresh, expires
 
 
 def _post_token(form):
@@ -200,22 +228,27 @@ class _NoKubeRedirect(urllib.request.HTTPRedirectHandler):
         raise StoreError
 
 
-def secret_document(name, namespace, payload, exported_at):
+def secret_document(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    name, namespace, key, payload, expires_at, version=None
+):
     encoded = base64.b64encode(payload).decode("ascii")
+    metadata = {
+        "name": name,
+        "namespace": namespace,
+        "annotations": {EXPIRES_AT: str(int(expires_at))},
+    }
+    if version is not None:
+        metadata["resourceVersion"] = version
     return {
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "annotations": {EXPORTED_AT: str(int(exported_at))},
-        },
+        "metadata": metadata,
         "type": "Opaque",
-        "data": {REFRESH_DATA_KEY: encoded},
+        "data": {key: encoded},
     }
 
 
-def _secret_data(document):
+def _secret_value(document, key):  # pylint: disable=too-many-return-statements
     if not isinstance(document, dict):
         return None
     if document.get("kind") != "Secret" or document.get("type") != "Opaque":
@@ -224,44 +257,32 @@ def _secret_data(document):
     data = document.get("data")
     if not isinstance(metadata, dict) or not isinstance(data, dict):
         return None
-    if set(data) != {REFRESH_DATA_KEY}:
+    if set(data) != {key}:
         return None
-    raw = data[REFRESH_DATA_KEY]
+    raw = data[key]
     if not isinstance(raw, str):
         return None
-    return raw
-
-
-def describe_secret(document, now):
-    raw = _secret_data(document)
-    if raw is None:
-        return "unexpected", None
-    name = document["metadata"].get("name")
-    if not isinstance(name, str) or not name:
-        return "unexpected", None
     try:
-        size = len(base64.b64decode(raw, validate=True))
+        value = base64.b64decode(raw, validate=True)
     except ValueError:
-        return "unexpected", None
-    annotations = document["metadata"].get("annotations")
-    if not isinstance(annotations, dict):
-        annotations = {}
-    stamp = annotations.get(EXPORTED_AT)
-    if not isinstance(stamp, str) or not stamp.isdecimal():
-        return "outstanding", (name, size, None)
-    exported = int(stamp)
-    reason = "outstanding"
-    if now - exported >= HANDOFF_TTL_SECONDS:
-        reason = "expired"
-    return reason, (name, size, exported)
+        return None
+    annotations = metadata.get("annotations")
+    expires_at = None
+    if isinstance(annotations, dict):
+        stamp = annotations.get(EXPIRES_AT)
+        if isinstance(stamp, str) and stamp.isdecimal():
+            expires_at = int(stamp)
+    version = metadata.get("resourceVersion")
+    return value, expires_at, version
 
 
-class SecretStore:
+class SecretStore:  # pylint: disable=too-many-instance-attributes
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         namespace,
-        name,
+        refresh_name,
+        access_name,
         api,
         token_path,
         ca_path,
@@ -269,7 +290,8 @@ class SecretStore:
         opener=None,
     ):
         self._namespace = namespace
-        self._name = name
+        self._refresh_name = refresh_name
+        self._access_name = access_name
         self._api = api.rstrip("/")
         self._token_path = token_path
         self._ca_path = ca_path
@@ -280,45 +302,76 @@ class SecretStore:
         self._now = now
 
     def snapshot(self):
-        reason, row = self._read()
-        if row is None:
-            return reason, []
-        return reason, [row]
-
-    def publish(self, payload):
-        reason, _row = self._read()
-        if reason is not None:
-            raise HandoffBlocked
-        body = json.dumps(
-            secret_document(self._name, self._namespace, payload, self._now())
-        ).encode("utf-8")
         try:
-            status, _ignored = self._call("POST", self._collection(), body)
+            access, refresh, expires_at = self.current()
         except StoreError:
-            raise HandoffBlocked from None
-        if status not in (200, 201):
-            raise HandoffBlocked
+            return "unavailable", _empty_tokens()
+        return None, _token_view(access, refresh, expires_at)
+
+    def current(self):
+        access, access_expires = self._value(self._access_name, ACCESS_DATA_KEY)
+        refresh, _refresh_expires = self._value(self._refresh_name, REFRESH_DATA_KEY)
+        expires_at = access_expires
+        return access, refresh, expires_at
+
+    def publish(self, access, refresh, expires_at):
+        self._upsert(self._refresh_name, REFRESH_DATA_KEY, refresh, expires_at)
+        self._upsert(self._access_name, ACCESS_DATA_KEY, access, expires_at)
 
     def _collection(self):
         return self._api + "/api/v1/namespaces/" + self._namespace + "/secrets"
 
-    def _item(self):
-        return self._collection() + "/" + self._name
+    def _item(self, name):
+        return self._collection() + "/" + name
 
-    def _read(self):
+    def _value(self, name, key):
         try:
-            status, payload = self._call("GET", self._item(), None)
+            status, payload = self._call("GET", self._item(name), None)
         except StoreError:
-            return "unavailable", None
+            raise StoreError from None
         if status == 404:
             return None, None
         if status != 200:
-            return "unavailable", None
+            raise StoreError
         try:
             document = json.loads(payload.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError):
-            return "unavailable", None
-        return describe_secret(document, self._now())
+            raise StoreError from None
+        parsed = _secret_value(document, key)
+        if parsed is None:
+            raise StoreError
+        value, expires_at, _version = parsed
+        return value, expires_at
+
+    def _upsert(self, name, key, payload, expires_at):
+        try:
+            status, body = self._call("GET", self._item(name), None)
+        except StoreError:
+            raise HandoffBlocked from None
+        version = None
+        if status == 200:
+            try:
+                current = json.loads(body.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError):
+                raise HandoffBlocked from None
+            metadata = current.get("metadata") if isinstance(current, dict) else None
+            if isinstance(metadata, dict):
+                version = metadata.get("resourceVersion")
+        elif status != 404:
+            raise HandoffBlocked
+        document = secret_document(
+            name, self._namespace, key, payload, expires_at, version
+        )
+        encoded = json.dumps(document).encode("utf-8")
+        try:
+            if version is None:
+                written, _ignored = self._call("POST", self._collection(), encoded)
+            else:
+                written, _ignored = self._call("PUT", self._item(name), encoded)
+        except StoreError:
+            raise HandoffBlocked from None
+        if written not in (200, 201):
+            raise HandoffBlocked
 
     def _call(self, method, url, body):
         if self._opener is not None:
@@ -431,11 +484,10 @@ class Broker:  # pylint: disable=too-many-instance-attributes
         if self._block_reason() is not None:
             self._mark("failed")
             return 500, b"error"
-        refresh = b""
         try:
             status, content_type, body = self._exchange_code(flow, code)
-            refresh = accepted_refresh(status, content_type, body)
-            self._publish(refresh)
+            access, refresh, expires_in = accepted_tokens(status, content_type, body)
+            self._publish(access, refresh, self._now() + expires_in)
         except (
             ExchangeFailed,
             HandoffBlocked,
@@ -446,29 +498,53 @@ class Broker:  # pylint: disable=too-many-instance-attributes
         ):
             self._mark("failed")
             return 500, b"error"
-        finally:
-            refresh = b""
         self._mark("completed")
         _LOG.info("export-completed")
         return 200, b"ok"
 
+    def refresh_if_due(self):
+        with self._lock:
+            try:
+                _access, refresh, expires_at = self._store.current()
+            except StoreError:
+                _LOG.info("refresh-failed")
+                return
+            if refresh is None:
+                return
+            if (
+                expires_at is not None
+                and self._now() + REFRESH_LEAD_SECONDS < expires_at
+            ):
+                return
+            try:
+                status, content_type, body = self._refresh_grant(refresh)
+                access, rotated, expires_in = accepted_tokens(
+                    status, content_type, body
+                )
+                self._store.publish(access, rotated, self._now() + expires_in)
+            except (
+                ExchangeFailed,
+                HandoffBlocked,
+                StoreError,
+                OSError,
+                TimeoutError,
+                ValueError,
+            ):
+                _LOG.info("refresh-failed")
+                return
+        _LOG.info("refresh-completed")
+
     def status(self):
         with self._lock:
             self._sweep()
-            reason, handoffs = self._store.snapshot()
+            reason, tokens = self._store.snapshot()
             pending = len(self._flows)
             last_export = self._last_export
-        rows = []
-        for name, size, exported in handoffs:
-            row = {"bytes": size, "name": name}
-            if exported is not None:
-                row["age_seconds"] = int(self._now() - exported)
-            rows.append(row)
         return {
             "blocked": reason,
-            "handoffs": rows,
             "last_export": last_export,
             "pending": pending,
+            "tokens": tokens,
         }
 
     def ready_problem(self):
@@ -484,6 +560,16 @@ class Broker:  # pylint: disable=too-many-instance-attributes
             "code_verifier": flow.verifier,
             "grant_type": "authorization_code",
             "redirect_uri": flow.redirect_uri,
+        }
+        if self._exchange is not None:
+            return self._exchange(form)
+        return _post_token(form)
+
+    def _refresh_grant(self, refresh):
+        form = {
+            "client_id": self._keystring,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh.decode("ascii"),
         }
         if self._exchange is not None:
             return self._exchange(form)
@@ -518,12 +604,14 @@ class Broker:  # pylint: disable=too-many-instance-attributes
             del self._flows[state]
 
     def _block_reason(self):
-        reason, _rows = self._store.snapshot()
-        return reason
+        reason, _tokens = self._store.snapshot()
+        if reason == "unavailable":
+            return "unavailable"
+        return None
 
-    def _publish(self, payload):
+    def _publish(self, access, refresh, expires_at):
         with self._lock:
-            self._store.publish(payload)
+            self._store.publish(access, refresh, expires_at)
 
     def _mark(self, result):
         with self._lock:
@@ -682,6 +770,12 @@ def load_keystring(path):
     return value
 
 
+def _refresh_loop(broker, stop):
+    while not stop.is_set():
+        broker.refresh_if_due()
+        stop.wait(60)
+
+
 def serve(broker, public_host, public_port, private_host, private_port):
     if private_host != "127.0.0.1":
         raise SystemExit(2)
@@ -710,6 +804,12 @@ def serve(broker, public_host, public_port, private_host, private_port):
     )
     for thread in threads:
         thread.start()
+    refresher = threading.Thread(
+        target=_refresh_loop,
+        args=(broker, stop),
+        daemon=True,
+    )
+    refresher.start()
     _LOG.info("broker-started")
     stop.wait()
     public.server_close()
@@ -720,7 +820,8 @@ def main():
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     path = os.environ.get("ETSY_KEYSTRING_FILE", "/run/secrets/etsy/keystring")
     namespace = os.environ.get("ETSY_NAMESPACE", "etsy")
-    secret_name = os.environ.get("ETSY_REFRESH_SECRET", REFRESH_SECRET_NAME)
+    refresh_name = os.environ.get("ETSY_REFRESH_SECRET", REFRESH_SECRET_NAME)
+    access_name = os.environ.get("ETSY_ACCESS_SECRET", ACCESS_SECRET_NAME)
     api = os.environ.get("KUBERNETES_API", "https://kubernetes.default.svc")
     token_path = os.environ.get(
         "KUBERNETES_TOKEN_FILE",
@@ -734,7 +835,15 @@ def main():
         keystring = load_keystring(path)
     except OSError:
         raise SystemExit(2) from None
-    store = SecretStore(namespace, secret_name, api, token_path, ca_path, time.time)
+    store = SecretStore(
+        namespace,
+        refresh_name,
+        access_name,
+        api,
+        token_path,
+        ca_path,
+        time.time,
+    )
     broker = Broker(keystring, store)
     serve(broker, "0.0.0.0", 8080, "127.0.0.1", 8091)
 
