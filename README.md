@@ -50,6 +50,12 @@ A tag `hermes-v0.22.2-screen` publishes the image as `0.22.2-screen`. Pushes to 
 
 A push to `main` publishes `edge`.
 
+## etsy-oauth-broker
+
+`etsy-oauth-broker/` builds `ghcr.io/dragoncrafted87/etsy-oauth-broker` from Alpine 3.24. It runs one Etsy authorization-code consent and writes the raw refresh token into one namespace Secret.
+
+A tag `etsy-oauth-broker-v1.0.0` publishes the image as `1.0.0`. Pushes to `main` publish `edge`.
+
 ## host-status
 
 `host-status/` builds `ghcr.io/dragoncrafted87/alpine-host-status` from Alpine 3.24. It publishes CPU, memory, temperature, and default-route rates to MQTT.

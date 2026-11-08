@@ -14,6 +14,7 @@ on:
     - speedtest-mqtt-v*
     - host-status-v*
     - hermes-v*
+    - etsy-oauth-broker-v*
 
 jobs:
   test:
@@ -45,6 +46,8 @@ jobs:
       run: bash host-status/prove.sh
     - name: Hermes prove
       run: bash hermes/prove.sh
+    - name: Etsy OAuth broker tests
+      run: python3 -m unittest discover -s etsy-oauth-broker -v
 
   build:
     needs: test
@@ -67,6 +70,7 @@ jobs:
         echo "speedtest=ghcr.io/${owner}/alpine-speedtest-mqtt-publisher" >> "$GITHUB_OUTPUT"
         echo "host_status=ghcr.io/${owner}/alpine-host-status" >> "$GITHUB_OUTPUT"
         echo "hermes=ghcr.io/${owner}/hermes-agent" >> "$GITHUB_OUTPUT"
+        echo "etsy=ghcr.io/${owner}/etsy-oauth-broker" >> "$GITHUB_OUTPUT"
     - name: Publish which images
       id: push
       run: |
@@ -78,6 +82,7 @@ jobs:
         speedtest=false
         host_status=false
         hermes=false
+        etsy=false
         ref="$GITHUB_REF"
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$ref" = "refs/heads/main" ]; then
         base=true
@@ -88,6 +93,7 @@ jobs:
         speedtest=true
         host_status=true
         hermes=true
+        etsy=true
         fi
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/base-v}" != "$ref" ]; then
         base=true
@@ -113,6 +119,9 @@ jobs:
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/hermes-v}" != "$ref" ]; then
         hermes=true
         fi
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "${ref#refs/tags/etsy-oauth-broker-v}" != "$ref" ]; then
+        etsy=true
+        fi
         echo "base=$base" >> "$GITHUB_OUTPUT"
         echo "minecraft=$minecraft" >> "$GITHUB_OUTPUT"
         echo "foundry=$foundry" >> "$GITHUB_OUTPUT"
@@ -121,6 +130,7 @@ jobs:
         echo "speedtest=$speedtest" >> "$GITHUB_OUTPUT"
         echo "host_status=$host_status" >> "$GITHUB_OUTPUT"
         echo "hermes=$hermes" >> "$GITHUB_OUTPUT"
+        echo "etsy=$etsy" >> "$GITHUB_OUTPUT"
     - name: Base meta
       id: base-meta
       uses: docker/metadata-action@v5
@@ -218,6 +228,18 @@ jobs:
           type=edge,branch=main
           type=match,pattern=hermes-v(.*),group=1
           type=sha
+    - name: Etsy OAuth broker meta
+      id: etsy-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.image.outputs.etsy }}
+        bake-target: etsy-oauth-broker-meta
+        flavor: |
+          latest=false
+        tags: |
+          type=edge,branch=main
+          type=match,pattern=etsy-oauth-broker-v(.*),group=1
+          type=sha
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
@@ -240,9 +262,10 @@ jobs:
         PUSH_SPEEDTEST: ${{ steps.push.outputs.speedtest }}
         PUSH_HOST_STATUS: ${{ steps.push.outputs.host_status }}
         PUSH_HERMES: ${{ steps.push.outputs.hermes }}
+        PUSH_ETSY: ${{ steps.push.outputs.etsy }}
       with:
         source: .
-        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt,host-status,hermes
+        targets: base,minecraft,foundry,backup,ambient-weather-mqtt,speedtest-mqtt,host-status,hermes,etsy-oauth-broker
         files: |
           ./docker-bake.hcl
           cwd://${{ steps.base-meta.outputs.bake-file }}
@@ -253,3 +276,4 @@ jobs:
           cwd://${{ steps.speedtest-meta.outputs.bake-file }}
           cwd://${{ steps.host-status-meta.outputs.bake-file }}
           cwd://${{ steps.hermes-meta.outputs.bake-file }}
+          cwd://${{ steps.etsy-meta.outputs.bake-file }}
