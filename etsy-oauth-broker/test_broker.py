@@ -114,6 +114,11 @@ class BrokerCase(unittest.TestCase):
         self.assertEqual([KEY], query["client_id"])
         self.assertEqual([broker.REDIRECT_URI], query["redirect_uri"])
         self.assertEqual([SCOPES], query["scope"])
+        self.assertIn(
+            "scope=listings_r%20listings_w%20shops_r%20shops_w",
+            parts.query,
+        )
+        self.assertNotIn("listings_r+", parts.query)
         self.assertEqual(["S256"], query["code_challenge_method"])
         self.assertEqual(
             [broker.challenge_for(self._verifier_for(instance, query["state"][0]))],

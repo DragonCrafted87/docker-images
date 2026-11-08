@@ -102,6 +102,8 @@ def new_state():
 
 
 def authorization_url(client_id, state, challenge):
+    # Etsy requires a space in scope to be %20. urlencode's default
+    # quote_plus writes +, and Etsy then rejects the permission list.
     query = urllib.parse.urlencode(
         (
             ("response_type", "code"),
@@ -111,7 +113,8 @@ def authorization_url(client_id, state, challenge):
             ("state", state),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
-        )
+        ),
+        quote_via=urllib.parse.quote,
     )
     return AUTH_ENDPOINT + "?" + query
 
