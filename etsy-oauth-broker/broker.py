@@ -13,6 +13,7 @@ import os
 import secrets
 import signal
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -26,6 +27,7 @@ REDIRECT_URI = "https://etsy.stealthdragonland.net/oauth/callback"
 SCOPES = "listings_r listings_w shops_r shops_w"
 AUTH_ENDPOINT = "https://www.etsy.com/oauth/connect"
 TOKEN_ENDPOINT = "https://api.etsy.com/v3/public/oauth/token"
+ISSUER = "https://openapi.etsy.com"
 
 STATE_TTL_SECONDS = 600
 HANDOFF_TTL_SECONDS = 24 * 60 * 60
@@ -43,7 +45,7 @@ MAX_SECRET_BODY = 65536
 
 _LOG = logging.getLogger("etsy.oauth")
 _UNRESERVED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-_QUERY_KEYS = {"code", "error", "error_description", "error_uri", "state"}
+_QUERY_KEYS = {"code", "error", "error_description", "error_uri", "iss", "state"}
 _TOKEN_FIELDS = (
     "access_token",
     "expires_in",
@@ -408,6 +410,7 @@ class Broker:  # pylint: disable=too-many-instance-attributes
         try:
             params = _parse_query(query)
         except ValueError:
+            _LOG.info("callback-rejected")
             return 400, b"error"
         if "error" in params:
             if self._consume(params.get("state", "")) is None:
@@ -420,6 +423,7 @@ class Broker:  # pylint: disable=too-many-instance-attributes
             return 400, b"error"
         flow = self._consume(state)
         if flow is None:
+            _LOG.info("callback-unknown-state")
             return 400, b"error"
         if flow.scopes != SCOPES or flow.redirect_uri != REDIRECT_URI:
             self._mark("failed")
@@ -549,6 +553,9 @@ def _parse_query(query):
             raise ValueError
         flat[key] = values[0]
     if "error" in flat and "code" in flat:
+        raise ValueError
+    issuer = flat.pop("iss", None)
+    if issuer is not None and issuer != ISSUER:
         raise ValueError
     return flat
 
@@ -710,6 +717,7 @@ def serve(broker, public_host, public_port, private_host, private_port):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     path = os.environ.get("ETSY_KEYSTRING_FILE", "/run/secrets/etsy/keystring")
     namespace = os.environ.get("ETSY_NAMESPACE", "etsy")
     secret_name = os.environ.get("ETSY_REFRESH_SECRET", REFRESH_SECRET_NAME)

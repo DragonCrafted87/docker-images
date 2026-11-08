@@ -67,7 +67,7 @@ class MemoryStore:
         self.record = (bytes(payload), self._now())
 
 
-class BrokerCase(unittest.TestCase):
+class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
 
     def setUp(self):
         self.store = MemoryStore()
@@ -114,17 +114,39 @@ class BrokerCase(unittest.TestCase):
         self.assertEqual([KEY], query["client_id"])
         self.assertEqual([broker.REDIRECT_URI], query["redirect_uri"])
         self.assertEqual([SCOPES], query["scope"])
-        self.assertIn(
-            "scope=listings_r%20listings_w%20shops_r%20shops_w",
-            parts.query,
-        )
-        self.assertNotIn("listings_r+", parts.query)
         self.assertEqual(["S256"], query["code_challenge_method"])
         self.assertEqual(
             [broker.challenge_for(self._verifier_for(instance, query["state"][0]))],
             query["code_challenge"],
         )
         return parts.query, query
+
+    def test_issuer_parameter_is_accepted(self):
+        instance = self._make()
+        callback, _state, _verifier = self._callback_of(instance)
+        issued = callback + "&iss=" + urllib.parse.quote(broker.ISSUER, safe="")
+        self.assertEqual((200, b"ok"), instance.callback(issued))
+        self.assertEqual(REFRESH.encode("ascii"), self.store.record[0])
+        self.assertNotIn(broker.ISSUER, self._log_text())
+
+    def test_wrong_issuer_does_not_consume_the_flow(self):
+        instance = self._make()
+        callback, state, _verifier = self._callback_of(instance)
+        rejected = callback + "&iss=https://evil.example"
+        self.assertEqual((400, b"error"), instance.callback(rejected))
+        self.assertIn(state, instance._flows)
+        self.assertIsNone(self.store.record)
+        self.assertIn("callback-rejected", self._log_text())
+
+    def test_scope_encoding_uses_percent_twenty(self):
+        instance = self._make()
+        _status, payload = instance.start_flow()
+        parts = urllib.parse.urlsplit(payload["authorization_url"])
+        self.assertIn(
+            "scope=listings_r%20listings_w%20shops_r%20shops_w",
+            parts.query,
+        )
+        self.assertNotIn("listings_r+", parts.query)
 
     def _verifier_for(self, instance, state):
         return instance._flows[state].verifier
