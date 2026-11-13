@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 
 REDIRECT_URI = "https://etsy.stealthdragonland.net/oauth/callback"
-SCOPES = "listings_r listings_w shops_r shops_w"
+SCOPES = "listings_r listings_w shops_r shops_w transactions_r feedback_r billing_r"
 AUTH_ENDPOINT = "https://www.etsy.com/oauth/connect"
 TOKEN_ENDPOINT = "https://api.etsy.com/v3/public/oauth/token"
 ISSUER = "https://openapi.etsy.com"
