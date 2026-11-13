@@ -1,8 +1,8 @@
 # etsy-oauth-broker
 
-`etsy-oauth-broker/` builds `ghcr.io/dragoncrafted87/etsy-oauth-broker` from Alpine 3.24 and Python's standard library. The process runs the Etsy authorization-code flow for `https://etsy.stealthdragonland.net/oauth/callback` and the scopes `listings_r`, `listings_w`, `shops_r`, and `shops_w`.
+`etsy-oauth-broker/` builds `ghcr.io/dragoncrafted87/etsy-oauth-broker` from Alpine 3.24 and Python's standard library. The process runs the Etsy authorization-code flow for `https://etsy.stealthdragonland.net/oauth/callback` and the scopes `listings_r`, `listings_w`, `shops_r`, `shops_w`, `transactions_r`, `feedback_r`, and `billing_r`.
 
-`listings_w` can create and edit listings, including publication. `shops_w` can update the shop description, messages, and sections. The broker does not call those endpoints. It stores the access token in Secret `etsy-access-token` and the refresh token in Secret `etsy-refresh-token`. The access token is refreshed before it expires, and the rotated refresh token is saved. The process does not serve either token on HTTP.
+`listings_w` can create and edit listings, including publication. `shops_w` can update the shop description, messages, and sections. `transactions_r` reads purchase and sales data. `feedback_r` reads feedback, including purchase history. `billing_r` reads billing statements. The broker does not call those endpoints. A token granted only the older four scopes will fail refresh until the shop consents again. It stores the access token in Secret `etsy-access-token` and the refresh token in Secret `etsy-refresh-token`. The access token is refreshed before it expires, and the rotated refresh token is saved. The process does not serve either token on HTTP.
 
 The public listener is `0.0.0.0:8080` and answers `GET /oauth/callback`, `GET /healthz`, and `GET /readyz`. Every other public path is `404`. The private listener is `127.0.0.1:8091` and answers `POST /flows` and `GET /status`. `POST /flows` takes an empty body and returns the Etsy authorization URL. `GET /status` returns pending-flow and Secret metadata. Neither listener has a route that returns a token.
 

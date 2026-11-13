@@ -19,7 +19,7 @@ ACCESS = "ACCESSTOKENSENTINEL"
 CODE = "AUTHCODESENTINEL"
 DETAIL = "PROVIDERERRORSENTINEL"
 KEY = "keystring-value"
-SCOPES = "listings_r listings_w shops_r shops_w"
+SCOPES = "listings_r listings_w shops_r shops_w transactions_r feedback_r billing_r"
 
 
 def token_body(refresh=REFRESH, access=ACCESS, **overrides):
@@ -145,7 +145,7 @@ class BrokerCase(unittest.TestCase):  # pylint: disable=too-many-public-methods
         _status, payload = instance.start_flow()
         parts = urllib.parse.urlsplit(payload["authorization_url"])
         self.assertIn(
-            "scope=listings_r%20listings_w%20shops_r%20shops_w",
+            "scope=listings_r%20listings_w%20shops_r%20shops_w%20transactions_r%20feedback_r%20billing_r",
             parts.query,
         )
         self.assertNotIn("listings_r+", parts.query)
